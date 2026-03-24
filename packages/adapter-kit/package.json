@@ -3,16 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/adapter-kit/src/index.js",
+  "types": "./dist/adapter-kit/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "types": "./dist/adapter-kit/src/index.d.ts",
+      "default": "./dist/adapter-kit/src/index.js"
     },
     "./testing": {
-      "types": "./dist/testing/index.d.ts",
-      "default": "./dist/testing/index.js"
+      "types": "./dist/adapter-kit/src/testing/index.d.ts",
+      "default": "./dist/adapter-kit/src/testing/index.js"
     }
   },
   "scripts": {

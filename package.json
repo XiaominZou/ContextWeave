@@ -11,7 +11,7 @@
                     "typecheck":  "tsc -p packages/core/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/client/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/testing/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json --noEmit",
                     "demo":  "vitest run packages/client/src/__tests__/context-platform-demo.test.ts",
                     "build":  "tsc -p packages/core/tsconfig.json \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json \u0026\u0026 tsc -p packages/testing/tsconfig.json \u0026\u0026 tsc -p packages/client/tsconfig.json \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json",
-                    "openclaw:daemon":  "node scripts/openclaw-platform-daemon.mjs",
+                    "openclaw:daemon":  "node --experimental-strip-types --loader ./scripts/ctx-node-loader.mjs scripts/openclaw-platform-daemon.mjs",
                     "openclaw:install-plugin":  "node scripts/install-openclaw-plugin.mjs",
                     "opencode:daemon":  "node scripts/opencode-platform-daemon.mjs",
                     "opencode:install-plugin":  "node scripts/install-opencode-plugin.mjs"

@@ -3,16 +3,28 @@ import http from "node:http";
 import crypto from "node:crypto";
 import path from "node:path";
 
+import { createContextPlatform } from "../packages/client/src/platform.ts";
+import { defaultCapabilityPolicy } from "../packages/core/src/policies.ts";
+import { createInMemoryMemorySubsystem } from "../packages/testing/src/in-memory-memory.ts";
+import { InMemoryStore } from "../packages/testing/src/in-memory-store.ts";
+
 const HOST = process.env.CTX_OPENCLAW_DAEMON_HOST || "127.0.0.1";
 const PORT = Number(process.env.CTX_OPENCLAW_DAEMON_PORT || "4318");
 const USER_ID = process.env.CTX_OPENCLAW_USER_ID || undefined;
 
+const store = new InMemoryStore();
+const memorySubsystem = createInMemoryMemorySubsystem();
+const platform = createContextPlatform({
+  store,
+  memory: {
+    provider: memorySubsystem.provider,
+    engine: memorySubsystem.engine,
+  },
+});
+const client = platform.client();
+
 const bindings = new Map();
-const sessions = new Map();
-const tasks = new Map();
-const memories = new Map();
 const transcripts = new Map();
-let nextMemoryId = 1;
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -29,16 +41,17 @@ const server = http.createServer(async (request, response) => {
         host: HOST,
         port: PORT,
         bindings: bindings.size,
-        sessions: sessions.size,
-        tasks: tasks.size,
-        memories: memories.size,
+        sessions: store.sessions.size,
+        tasks: store.tasks.size,
+        runs: store.runs.size,
+        memories: memorySubsystem.state.records.size,
       });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/bootstrap") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
+      const binding = await ensureBinding(body);
       writeJson(response, 200, {
         bootstrapped: true,
         importedMessages: transcripts.get(binding.sessionId)?.length ?? 0,
@@ -49,43 +62,65 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/ingest") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
+      const binding = await ensureBinding(body);
       appendTranscript(binding.sessionId, body.message);
-      maybeUpdateTaskFromMessage(binding, body.message);
+      await maybeUpdateTaskFromMessage(binding, body.message);
       writeJson(response, 200, { ingested: true, binding });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/assemble") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
-      const task = tasks.get(binding.taskId);
-      const relevantMemories = selectRelevantMemories(binding.workspaceId, body.prompt || task?.objective || "");
-      const systemPromptAddition = renderPlatformContext({
-        binding,
-        task,
-        relevantMemories,
-        tokenBudget: body.tokenBudget,
-      });
+      const binding = await ensureBinding(body);
 
       if (typeof body.prompt === "string" && body.prompt.trim()) {
-        task.objective = body.prompt.trim();
-        task.title = summarize(body.prompt);
-        task.updatedAt = new Date().toISOString();
+        await client.tasks.update(binding.taskId, {
+          title: summarize(body.prompt),
+          objective: body.prompt.trim(),
+          status: "running",
+        });
       }
+
+      const preview = await client.experimental.context.preview({
+        workspaceId: binding.workspaceId,
+        sessionId: binding.sessionId,
+        taskId: binding.taskId,
+        adapter: "openclaw",
+        model: typeof body.model === "string" ? body.model : undefined,
+        metadata: {
+          userId: USER_ID,
+          prompt: typeof body.prompt === "string" ? body.prompt : undefined,
+          workspaceDir: binding.workspaceDir,
+          openclawSessionRef: binding.sessionRef,
+        },
+        policy: {
+          ...defaultCapabilityPolicy,
+          context: "inject",
+          memory: "platform",
+          tasks: "observe-native",
+          artifacts: "observe",
+        },
+      });
+
+      const systemPromptAddition = renderSnapshot(preview.snapshot, {
+        workspaceDir: binding.workspaceDir,
+        tokenBudget: typeof body.tokenBudget === "number" ? body.tokenBudget : undefined,
+      });
 
       writeJson(response, 200, {
         messages: Array.isArray(body.messages) ? body.messages : [],
-        estimatedTokens: estimateMessages(Array.isArray(body.messages) ? body.messages : []) + Math.ceil(systemPromptAddition.length / 4),
+        estimatedTokens: preview.snapshot.tokenEstimate + estimateMessages(Array.isArray(body.messages) ? body.messages : []),
         systemPromptAddition,
         binding,
+        snapshotId: preview.snapshot.id,
+        explanation: preview.explanation,
       });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/compact") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
+      const binding = await ensureBinding(body);
       writeJson(response, 200, {
         ok: true,
         compacted: false,
@@ -99,11 +134,11 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/after-turn") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
+      const binding = await ensureBinding(body);
       const messages = Array.isArray(body.messages) ? body.messages : [];
       for (const message of messages) {
         appendTranscript(binding.sessionId, message);
-        maybeUpdateTaskFromMessage(binding, message);
+        await maybeUpdateTaskFromMessage(binding, message);
       }
       writeJson(response, 200, { ok: true, binding });
       return;
@@ -111,33 +146,34 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/memory/remember") {
       const body = await readJson(request);
-      const binding = ensureBinding(body);
+      const binding = await ensureBinding(body);
       if (typeof body.content !== "string" || !body.content.trim()) {
         writeJson(response, 400, { error: { code: "BAD_REQUEST", message: "content is required" } });
         return;
       }
-      const record = {
-        id: `mem_${nextMemoryId++}`,
-        workspaceId: binding.workspaceId,
-        userId: USER_ID,
-        sessionId: binding.sessionId,
-        taskId: binding.taskId,
-        ownerRef: USER_ID ? { type: "user", id: USER_ID } : { type: "workspace", id: binding.workspaceId },
-        scope: USER_ID ? "user" : "workspace",
-        layer: "long_term",
-        channel: USER_ID ? "profile" : "collection",
-        kind: typeof body.kind === "string" ? body.kind : "fact",
-        status: "active",
-        title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : summarize(body.content),
-        content: body.content.trim(),
-        summary: summarize(body.content),
-        importance: 0.8,
-        confidence: 0.9,
-        confirmedBy: "user",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      memories.set(record.id, record);
+
+      const record = await client.experimental.memory.writeConfirmed({
+        record: {
+          workspaceId: binding.workspaceId,
+          userId: USER_ID,
+          sessionId: binding.sessionId,
+          taskId: binding.taskId,
+          runId: undefined,
+          ownerRef: USER_ID ? { type: "user", id: USER_ID } : { type: "workspace", id: binding.workspaceId },
+          scope: USER_ID ? "user" : "workspace",
+          layer: "long_term",
+          channel: USER_ID ? "profile" : "collection",
+          kind: typeof body.kind === "string" ? body.kind : "fact",
+          status: "active",
+          title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : summarize(body.content),
+          content: body.content.trim(),
+          summary: typeof body.summary === "string" && body.summary.trim() ? body.summary.trim() : summarize(body.content),
+          importance: 0.8,
+          confidence: 0.9,
+          confirmedBy: "user",
+          sourceRefs: [{ type: "task", id: binding.taskId }],
+        },
+      });
       writeJson(response, 200, { ok: true, record, binding });
       return;
     }
@@ -145,9 +181,12 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/v1/openclaw/state") {
       writeJson(response, 200, {
         ok: true,
-        sessions: [...sessions.values()],
-        tasks: [...tasks.values()],
-        memories: [...memories.values()],
+        bindings: [...bindings.values()],
+        sessions: store.listSessions(),
+        tasks: store.listTasks(),
+        runs: [...store.runs.values()],
+        events: [...store.events.entries()],
+        memories: [...memorySubsystem.state.records.values()],
         transcripts: [...transcripts.entries()],
       });
       return;
@@ -163,7 +202,7 @@ server.listen(PORT, HOST, () => {
   process.stdout.write(`[ctx-openclaw-daemon] listening on http://${HOST}:${PORT}\n`);
 });
 
-function ensureBinding(input) {
+async function ensureBinding(input) {
   const workspaceDir = typeof input.workspaceDir === "string" && input.workspaceDir.trim()
     ? path.resolve(input.workspaceDir)
     : process.cwd();
@@ -178,38 +217,47 @@ function ensureBinding(input) {
     return existing;
   }
 
-  const now = new Date().toISOString();
   const workspaceId = `ws_${shortHash(workspaceDir)}`;
-  const sessionId = `sess_${shortHash(`${workspaceDir}:session:${sessionRef}`)}`;
-  const taskId = `task_${shortHash(`${workspaceDir}:task:${sessionRef}`)}`;
-  const session = {
-    id: sessionId,
+  const session = await client.sessions.create({
     workspaceId,
     title: path.basename(workspaceDir) || "OpenClaw Workspace",
-    status: "active",
-    metadata: { workspaceDir, sessionRef, userId: USER_ID },
-    createdAt: now,
-    updatedAt: now,
-  };
-  const task = {
-    id: taskId,
+    metadata: {
+      workspaceDir,
+      openclawSessionRef: sessionRef,
+      userId: USER_ID,
+    },
+  });
+  const canonicalSession = store.saveSession({
+    ...session,
+    externalRef: sessionRef,
+    metadata: {
+      ...session.metadata,
+      workspaceDir,
+      openclawSessionRef: sessionRef,
+      userId: USER_ID,
+    },
+  });
+
+  const task = await client.tasks.create({
     workspaceId,
-    sessionId,
+    sessionId: canonicalSession.id,
     title: "OpenClaw Active Task",
     objective: `Active OpenClaw session for ${workspaceDir}`,
+  });
+  const canonicalTask = await client.tasks.update(task.id, {
     status: "running",
-    createdAt: now,
-    updatedAt: now,
-  };
+    metadata: {
+      workspaceDir,
+      openclawSessionRef: sessionRef,
+    },
+  });
 
-  sessions.set(sessionId, session);
-  tasks.set(taskId, task);
-  transcripts.set(sessionId, []);
+  transcripts.set(canonicalSession.id, []);
 
   const binding = {
     workspaceId,
-    sessionId,
-    taskId,
+    sessionId: canonicalSession.id,
+    taskId: canonicalTask.id,
     workspaceDir,
     sessionRef,
   };
@@ -226,9 +274,8 @@ function appendTranscript(sessionId, message) {
   transcripts.set(sessionId, list.slice(-200));
 }
 
-function maybeUpdateTaskFromMessage(binding, message) {
-  const task = tasks.get(binding.taskId);
-  if (!task || !isRecord(message)) {
+async function maybeUpdateTaskFromMessage(binding, message) {
+  if (!isRecord(message)) {
     return;
   }
   const role = typeof message.role === "string" ? message.role : "";
@@ -239,45 +286,30 @@ function maybeUpdateTaskFromMessage(binding, message) {
   if (!text) {
     return;
   }
-  task.objective = text;
-  task.title = summarize(text);
-  task.updatedAt = new Date().toISOString();
+  await client.tasks.update(binding.taskId, {
+    title: summarize(text),
+    objective: text,
+    status: "running",
+  });
 }
 
-function selectRelevantMemories(workspaceId, query) {
-  return [...memories.values()]
-    .filter((record) => record.workspaceId === workspaceId)
-    .sort((a, b) => scoreMemory(b, query) - scoreMemory(a, query))
-    .slice(0, 8);
-}
-
-function renderPlatformContext(input) {
+function renderSnapshot(snapshot, input) {
   const sections = [
-    `[CTX_PLATFORM_WORKSPACE] ${input.binding.workspaceDir}`,
-    input.task
-      ? `[CTX_PLATFORM_TASK]
-Title: ${input.task.title}
-Objective: ${input.task.objective}`
-      : "",
-    input.relevantMemories.length
-      ? `[CTX_PLATFORM_MEMORY]
-${input.relevantMemories.map((record) => `- ${record.title}: ${record.summary || record.content}`).join("\n")}`
+    `[CTX_PLATFORM_WORKSPACE] ${input.workspaceDir}`,
+    `[CTX_PLATFORM_SNAPSHOT_ID] ${snapshot.id}`,
+    snapshot.blocks.length
+      ? `[CTX_PLATFORM_CONTEXT]\n${snapshot.blocks.map(renderBlock).join("\n\n")}`
       : "",
     typeof input.tokenBudget === "number"
       ? `[CTX_PLATFORM_BUDGET] ${input.tokenBudget} tokens`
       : "",
   ].filter(Boolean);
-
   return sections.join("\n\n");
 }
 
-function scoreMemory(record, query) {
-  const haystack = `${record.title} ${record.content} ${record.summary || ""}`.toLowerCase();
-  const tokens = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
-  if (!tokens.length) {
-    return 0;
-  }
-  return tokens.reduce((score, token) => score + (haystack.includes(token) ? 1 : 0), 0);
+function renderBlock(block) {
+  const title = block.title ? `${block.kind.toUpperCase()}: ${block.title}` : block.kind.toUpperCase();
+  return `[${title}]\n${block.content}`;
 }
 
 function estimateMessages(messages) {
