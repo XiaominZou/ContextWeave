@@ -1,0 +1,41 @@
+{
+    "compilerOptions":  {
+                            "target":  "ES2022",
+                            "module":  "ESNext",
+                            "moduleResolution":  "Bundler",
+                            "baseUrl":  ".",
+                            "paths":  {
+                                          "@ctx/core":  [
+                                                            "packages/core/src/index.ts"
+                                                        ],
+                                          "@ctx/client":  [
+                                                              "packages/client/src/index.ts"
+                                                          ],
+                                          "@ctx/adapter-kit":  [
+                                                                   "packages/adapter-kit/src/index.ts"
+                                                               ],
+                                          "@ctx/adapter-kit/testing":  [
+                                                                           "packages/adapter-kit/src/testing/index.ts"
+                                                                       ],
+                                          "@ctx/testing":  [
+                                                               "packages/testing/src/index.ts"
+                                                           ],
+                                          "@ctx/adapter-opencode":  [
+                                                                        "packages/adapter-opencode/src/index.ts"
+                                                                    ]
+                                      },
+                            "strict":  true,
+                            "declaration":  true,
+                            "declarationMap":  true,
+                            "esModuleInterop":  true,
+                            "forceConsistentCasingInFileNames":  true,
+                            "skipLibCheck":  true,
+                            "noEmitOnError":  true,
+                            "resolveJsonModule":  true,
+                            "isolatedModules":  true,
+                            "types":  [
+                                          "node"
+                                      ]
+                        }
+}
+

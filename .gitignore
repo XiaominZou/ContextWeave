@@ -1,0 +1,9 @@
+﻿node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.tmp_*/
+.tmp*.log
+.claude/
+.codex/
+.opencode/

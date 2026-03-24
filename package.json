@@ -1,0 +1,22 @@
+﻿{
+    "name":  "context-platform-sdk",
+    "private":  true,
+    "version":  "0.1.0",
+    "workspaces":  [
+                       "packages/*"
+                   ],
+    "scripts":  {
+                    "test":  "vitest run",
+                    "test:core":  "vitest run packages/core/src/__tests__",
+                    "typecheck":  "tsc -p packages/core/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/client/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/testing/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json --noEmit",
+                    "demo":  "vitest run packages/client/src/__tests__/context-platform-demo.test.ts",
+                    "build":  "tsc -p packages/core/tsconfig.json \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json \u0026\u0026 tsc -p packages/testing/tsconfig.json \u0026\u0026 tsc -p packages/client/tsconfig.json \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json",
+                    "opencode:daemon":  "node scripts/opencode-platform-daemon.mjs",
+                    "opencode:install-plugin":  "node scripts/install-opencode-plugin.mjs"
+                },
+    "devDependencies":  {
+                            "@types/node":  "^25.5.0",
+                            "typescript":  "^5.6.3",
+                            "vitest":  "^3.2.4"
+                        }
+}
