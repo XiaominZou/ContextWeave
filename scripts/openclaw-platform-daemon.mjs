@@ -22,6 +22,7 @@ const platform = createContextPlatform({
   },
 });
 const client = platform.client();
+let syntheticOpenClawAdapter;
 
 const bindings = new Map();
 const transcripts = new Map();
@@ -140,7 +141,42 @@ const server = http.createServer(async (request, response) => {
         appendTranscript(binding.sessionId, message);
         await maybeUpdateTaskFromMessage(binding, message);
       }
-      writeJson(response, 200, { ok: true, binding });
+
+      const prompt = resolvePromptText(body, messages);
+      syntheticOpenClawAdapter.enqueueTurn({
+        externalRef: binding.sessionRef,
+        rawEvents: buildSyntheticRunEvents(messages, body),
+      });
+      const handle = await client.runs.start({
+        workspaceId: binding.workspaceId,
+        sessionId: binding.sessionId,
+        taskId: binding.taskId,
+        adapter: syntheticOpenClawAdapter.name,
+        model: typeof body.model === "string" ? body.model : undefined,
+        metadata: {
+          userId: USER_ID,
+          prompt,
+          workspaceDir: binding.workspaceDir,
+          openclawSessionRef: binding.sessionRef,
+          openclawAfterTurn: true,
+        },
+        capabilityPolicy: {
+          ...defaultCapabilityPolicy,
+          context: "inject",
+          memory: "platform",
+          tasks: "observe-native",
+          artifacts: "observe",
+        },
+      });
+      const events = await collectEvents(handle);
+      writeJson(response, 200, {
+        ok: true,
+        binding,
+        runId: handle.runId,
+        externalRef: handle.externalRef,
+        eventCount: events.length,
+        eventTypes: events.map((event) => event.type),
+      });
       return;
     }
 
@@ -312,6 +348,79 @@ function renderBlock(block) {
   return `[${title}]\n${block.content}`;
 }
 
+function resolvePromptText(body, messages) {
+  if (typeof body.prompt === "string" && body.prompt.trim()) {
+    return body.prompt.trim();
+  }
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!isRecord(message) || message.role !== "user") {
+      continue;
+    }
+    const text = stringifyContent(message.content).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "OpenClaw turn";
+}
+
+function buildSyntheticRunEvents(messages, body) {
+  const rawEvents = [
+    {
+      type: "run_started",
+      model: typeof body.model === "string" ? body.model : undefined,
+      externalRef: typeof body.sessionKey === "string" ? body.sessionKey : typeof body.sessionId === "string" ? body.sessionId : undefined,
+    },
+  ];
+
+  let messageIndex = 0;
+  let toolIndex = 0;
+  for (const message of messages) {
+    if (!isRecord(message)) {
+      continue;
+    }
+    const role = typeof message.role === "string" ? message.role : "";
+    if (role === "assistant") {
+      const text = stringifyContent(message.content).trim();
+      if (!text) {
+        continue;
+      }
+      rawEvents.push({ type: "text_delta", text });
+      rawEvents.push({ type: "message_completed", messageId: `openclaw_msg_${++messageIndex}` });
+      continue;
+    }
+
+    if (role === "tool") {
+      const toolName = typeof message.name === "string" && message.name ? message.name : `tool_${++toolIndex}`;
+      const callId = typeof message.toolCallId === "string" && message.toolCallId ? message.toolCallId : `tool_call_${toolIndex}`;
+      rawEvents.push({
+        type: "tool_call",
+        callId,
+        name: toolName,
+        input: isRecord(message.input) ? message.input : {},
+      });
+      rawEvents.push({
+        type: "tool_result",
+        callId,
+        output: message.content ?? null,
+        isError: Boolean(message.isError),
+      });
+    }
+  }
+
+  rawEvents.push({ type: "run_completed", reason: typeof body.autoCompactionSummary === "string" ? "turn_complete_with_compaction" : "turn_complete" });
+  return rawEvents;
+}
+
+async function collectEvents(handle) {
+  const events = [];
+  for await (const event of handle.streamEvents()) {
+    events.push(event);
+  }
+  return events;
+}
+
 function estimateMessages(messages) {
   return Math.ceil(messages.map((message) => stringifyContent(message?.content)).join("\n").length / 4);
 }
@@ -362,4 +471,149 @@ function writeJson(response, status, body) {
   response.statusCode = status;
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.end(JSON.stringify(body));
+}
+
+class SyntheticOpenClawAdapter {
+  name = "openclaw-synthetic";
+  version = "0.1.0";
+  invocationMode = "sdk";
+  capabilities = {
+    invocationMode: "sdk",
+    streaming: true,
+    toolCalls: true,
+    checkpoints: false,
+    resume: false,
+    interrupt: true,
+    nativeMcp: false,
+    capabilitySupport: {
+      context: "intercept",
+      memory: "intercept",
+      tasks: "observe-only",
+      artifacts: "observe-only",
+    },
+  };
+
+  #queue = [];
+  #currentRunContext = null;
+
+  enqueueTurn(turn) {
+    this.#queue.push(turn);
+  }
+
+  async renderContext(input) {
+    return {
+      mode: "sdk",
+      systemPrompt: input.snapshot ? renderSnapshot(input.snapshot, { workspaceDir: String(input.run.metadata?.workspaceDir ?? ""), tokenBudget: undefined }) : "",
+      messages: [],
+      tools: [],
+    };
+  }
+
+  async createRun(input) {
+    const turn = this.#queue.shift();
+    if (!turn) {
+      throw new Error("SyntheticOpenClawAdapter.createRun() called without queued raw events");
+    }
+    this.#currentRunContext = {
+      workspaceId: input.run.workspaceId,
+      sessionId: input.run.sessionId,
+      taskId: input.run.taskId,
+      runId: input.run.id,
+    };
+    let cancelled = false;
+    return {
+      externalRef: turn.externalRef,
+      streamEvents: async function* () {
+        for (const rawEvent of turn.rawEvents) {
+          if (cancelled) {
+            break;
+          }
+          yield rawEvent;
+        }
+      },
+      cancel: async () => {
+        cancelled = true;
+      },
+    };
+  }
+
+  normalizeEvent(rawEvent) {
+    if (!isRecord(rawEvent) || typeof rawEvent.type !== "string") {
+      return null;
+    }
+    const context = this.#currentRunContext ?? {
+      workspaceId: "ws_contract",
+      sessionId: "sess_contract",
+      taskId: "task_contract",
+      runId: "run_contract",
+    };
+    return {
+      id: `evt_${Math.random().toString(36).slice(2, 10)}`,
+      workspaceId: context.workspaceId,
+      sessionId: context.sessionId,
+      taskId: context.taskId,
+      runId: context.runId,
+      adapter: this.name,
+      timestamp: new Date().toISOString(),
+      type: normalizeSyntheticType(rawEvent.type),
+      payload: normalizeSyntheticPayload(rawEvent),
+    };
+  }
+}
+
+syntheticOpenClawAdapter = new SyntheticOpenClawAdapter();
+platform.runtime.adapters.register(syntheticOpenClawAdapter);
+
+function normalizeSyntheticType(type) {
+  switch (type) {
+    case "run_started":
+      return "run.started";
+    case "text_delta":
+      return "message.delta";
+    case "message_completed":
+      return "message.completed";
+    case "tool_call":
+      return "tool.call";
+    case "tool_result":
+      return "tool.result";
+    case "run_completed":
+      return "run.completed";
+    case "run_failed":
+      return "run.failed";
+    case "run_cancelled":
+      return "run.cancelled";
+    default:
+      return type;
+  }
+}
+
+function normalizeSyntheticPayload(rawEvent) {
+  switch (rawEvent.type) {
+    case "run_started":
+      return { model: rawEvent.model, externalRef: rawEvent.externalRef };
+    case "text_delta":
+      return { role: "assistant", text: typeof rawEvent.text === "string" ? rawEvent.text : "" };
+    case "message_completed":
+      return { messageId: typeof rawEvent.messageId === "string" ? rawEvent.messageId : "msg_unknown" };
+    case "tool_call":
+      return {
+        callId: typeof rawEvent.callId === "string" ? rawEvent.callId : "call_unknown",
+        name: typeof rawEvent.name === "string" ? rawEvent.name : "unknown_tool",
+        input: rawEvent.input ?? {},
+      };
+    case "tool_result":
+      return {
+        callId: typeof rawEvent.callId === "string" ? rawEvent.callId : "call_unknown",
+        output: rawEvent.output ?? null,
+        isError: Boolean(rawEvent.isError),
+      };
+    case "run_completed":
+      return { reason: typeof rawEvent.reason === "string" ? rawEvent.reason : undefined };
+    case "run_failed":
+      return { error: rawEvent.error ?? { code: "OPENCLAW_SYNTHETIC_ERROR", message: "synthetic run failed" } };
+    case "run_cancelled":
+      return { reason: typeof rawEvent.reason === "string" ? rawEvent.reason : undefined };
+    default:
+      return {};
+  }
 }
