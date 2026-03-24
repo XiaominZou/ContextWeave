@@ -1,0 +1,40 @@
+{
+  "id": "ctx-platform-openclaw",
+  "name": "Context Platform OpenClaw",
+  "description": "Delegates OpenClaw context assembly to the Context Platform daemon.",
+  "version": "0.1.0",
+  "kind": "context-engine",
+  "uiHints": {
+    "daemonUrl": {
+      "label": "Daemon URL",
+      "help": "HTTP base URL for the Context Platform OpenClaw daemon.",
+      "placeholder": "http://127.0.0.1:4318"
+    },
+    "engineId": {
+      "label": "Engine ID",
+      "help": "Context engine id registered inside OpenClaw."
+    },
+    "usePlatformCompaction": {
+      "label": "Platform Compaction",
+      "help": "Enable only when the daemon implements compaction; otherwise OpenClaw runtime compaction is used."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "daemonUrl": {
+        "type": "string"
+      },
+      "engineId": {
+        "type": "string"
+      },
+      "workspaceDir": {
+        "type": "string"
+      },
+      "usePlatformCompaction": {
+        "type": "boolean"
+      }
+    }
+  }
+}

@@ -10,6 +10,7 @@ export default defineConfig({
       { find: "@ctx/core", replacement: resolve(__dirname, "packages/core/src/index.ts") },
       { find: "@ctx/client", replacement: resolve(__dirname, "packages/client/src/index.ts") },
       { find: "@ctx/testing", replacement: resolve(__dirname, "packages/testing/src/index.ts") },
+      { find: "@ctx/adapter-openclaw", replacement: resolve(__dirname, "packages/adapter-openclaw/src/index.ts") },
       { find: "@ctx/adapter-opencode", replacement: resolve(__dirname, "packages/adapter-opencode/src/index.ts") },
     ],
   },
