@@ -13,6 +13,7 @@ import {
 
 export type MockRawEvent =
   | { type: "run_started"; model?: string; externalRef?: string }
+  | { type: "run_usage"; inputTokens?: number; outputTokens?: number }
   | { type: "text_delta"; text: string }
   | { type: "message_completed"; messageId: string }
   | { type: "tool_call"; callId: string; name: string; input: unknown }
@@ -134,6 +135,15 @@ export class RawMockAdapter implements AgentAdapter {
     switch (raw.type) {
       case "run_started":
         return { ...base, type: "run.started", payload: { model: raw.model, externalRef: raw.externalRef ?? this.config.externalRef } };
+      case "run_usage":
+        return {
+          ...base,
+          type: "run.usage",
+          payload: {
+            inputTokens: raw.inputTokens,
+            outputTokens: raw.outputTokens,
+          },
+        };
       case "text_delta":
         return { ...base, type: "message.delta", payload: { role: "assistant", text: raw.text } };
       case "message_completed":

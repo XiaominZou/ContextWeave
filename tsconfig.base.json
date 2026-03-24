@@ -20,6 +20,9 @@
                                           "@ctx/testing":  [
                                                                "packages/testing/src/index.ts"
                                                            ],
+                                          "@ctx/benchmark":  [
+                                                                "packages/benchmark/src/index.ts"
+                                                            ],
                                           "@ctx/adapter-openclaw":  [
                                                                         "packages/adapter-openclaw/src/index.ts"
                                                                     ],

@@ -8,9 +8,11 @@
     "scripts":  {
                     "test":  "vitest run",
                     "test:core":  "vitest run packages/core/src/__tests__",
-                    "typecheck":  "tsc -p packages/core/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/client/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/testing/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json --noEmit",
+                    "typecheck":  "tsc -p packages/core/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/client/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/testing/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/benchmark/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json --noEmit \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json --noEmit",
                     "demo":  "vitest run packages/client/src/__tests__/context-platform-demo.test.ts",
-                    "build":  "tsc -p packages/core/tsconfig.json \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json \u0026\u0026 tsc -p packages/testing/tsconfig.json \u0026\u0026 tsc -p packages/client/tsconfig.json \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json",
+                    "build":  "tsc -p packages/core/tsconfig.json \u0026\u0026 tsc -p packages/adapter-kit/tsconfig.json \u0026\u0026 tsc -p packages/testing/tsconfig.json \u0026\u0026 tsc -p packages/benchmark/tsconfig.json \u0026\u0026 tsc -p packages/client/tsconfig.json \u0026\u0026 tsc -p packages/adapter-openclaw/tsconfig.json \u0026\u0026 tsc -p packages/adapter-opencode/tsconfig.json",
+                    "benchmark:smoke":  "npm run build && tsx packages/benchmark/scripts/run-benchmark.ts --smoke",
+                    "benchmark:all":  "npm run build && tsx packages/benchmark/scripts/run-benchmark.ts",
                     "openclaw:daemon":  "node --experimental-strip-types --loader ./scripts/ctx-node-loader.mjs scripts/openclaw-platform-daemon.mjs",
                     "openclaw:install-plugin":  "node scripts/install-openclaw-plugin.mjs",
                     "opencode:daemon":  "node scripts/opencode-platform-daemon.mjs",
@@ -18,6 +20,7 @@
                 },
     "devDependencies":  {
                             "@types/node":  "^25.5.0",
+                            "tsx":  "^4.20.6",
                             "typescript":  "^5.6.3",
                             "vitest":  "^3.2.4"
                         }

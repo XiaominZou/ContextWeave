@@ -19,9 +19,12 @@ The metrics system SHALL aggregate token usage across all LLM calls.
 - **WHEN** Mode C-real completes
 - **THEN** the system reports total memoryExtractionTokens separately
 
-#### Scenario: Calculate net savings for C-real
-- **WHEN** comparing Mode C-real to Mode B
-- **THEN** the system reports netSavings = grossSavings - memoryExtractionTokens
+### Requirement: Repeated-Run Summary
+The metrics system SHALL summarize repeated benchmark runs with lightweight distribution stats.
+
+#### Scenario: Report median and spread
+- **WHEN** a mode has multiple runs
+- **THEN** the system reports median, p25, and p75 for primary token metrics and completion score
 
 ### Requirement: Completion Score Calculation
 The metrics system SHALL calculate a 100-point completion score.
@@ -47,30 +50,36 @@ The metrics system SHALL calculate a 100-point completion score.
 - **THEN** not deleting tests contributes 10 points, runnable code contributes 5 points
 
 ### Requirement: Fair Comparison Validation
-The metrics system SHALL validate fair comparison conditions.
+The metrics system SHALL validate fair comparison conditions before token comparison.
 
-#### Scenario: Reject unfair comparison
-- **WHEN** two modes have completion score difference > 5 points
+#### Scenario: Reject unfair comparison by hidden tests
+- **WHEN** two modes differ by more than 1 hidden test pass
+- **THEN** the system flags the comparison as invalid
+
+#### Scenario: Reject unfair comparison by completion score
+- **WHEN** two modes have completion score difference > 5
 - **THEN** the system flags the comparison as invalid
 
 #### Scenario: Accept fair comparison
-- **WHEN** two modes have completion score difference <= 5 points
+- **WHEN** hidden test pass difference <= 1
+- **AND** completion score difference <= 5
 - **THEN** the system allows token comparison
 
 ### Requirement: Wasted Call Ratio
-The metrics system SHALL calculate wasted tool call ratio.
+The metrics system SHALL calculate wasted tool call ratio as an auxiliary metric.
 
 #### Scenario: Calculate ratio
 - **WHEN** all tool calls are analyzed
 - **THEN** the system reports wastedCalls / totalToolCalls per mode
+- **AND** the report marks it as auxiliary, not a primary success metric
 
 ### Requirement: Report Generation
 The metrics system SHALL generate human-readable and machine-readable reports.
 
 #### Scenario: Console report
 - **WHEN** benchmark completes
-- **THEN** a formatted table shows mode comparison
+- **THEN** a formatted table shows primary mode comparison
 
 #### Scenario: JSON report
 - **WHEN** benchmark completes
-- **THEN** a JSON file contains all raw metrics for further analysis
+- **THEN** a JSON file contains all raw metrics and repeated-run summaries

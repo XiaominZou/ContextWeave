@@ -145,6 +145,18 @@ export async function processRunStream(input: {
         continue;
       }
 
+      if (envelope.type === "run.usage") {
+        const payload = envelope.payload as { inputTokens?: number; outputTokens?: number };
+        input.store.saveRun({
+          ...currentRun,
+          usage: {
+            inputTokens: (currentRun.usage?.inputTokens ?? 0) + (payload.inputTokens ?? 0),
+            outputTokens: (currentRun.usage?.outputTokens ?? 0) + (payload.outputTokens ?? 0),
+          },
+        });
+        continue;
+      }
+
       if (!isTerminalEvent(envelope.type)) {
         continue;
       }

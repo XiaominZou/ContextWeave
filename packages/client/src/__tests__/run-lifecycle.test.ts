@@ -123,6 +123,39 @@ describe("Run lifecycle", () => {
     expect(runAfter.endedAt).toBeDefined();
   });
 
+  test("run usage is accumulated from run.usage events", async () => {
+    const { client } = createTestPlatform({
+      adapters: [
+        new RawMockAdapter({
+          rawEvents: [
+            { type: "run_started", model: "mock-model" },
+            { type: "run_usage", inputTokens: 120, outputTokens: 30 },
+            { type: "run_usage", inputTokens: 80, outputTokens: 20 },
+            { type: "run_completed", reason: "end_turn" },
+          ],
+        }),
+      ],
+    });
+
+    const session = await client.sessions.create({ workspaceId: "ws_1", title: "test" });
+    const task = await client.tasks.create({ workspaceId: "ws_1", sessionId: session.id, title: "test" });
+
+    const handle = await client.runs.start({
+      workspaceId: "ws_1",
+      sessionId: session.id,
+      taskId: task.id,
+      adapter: "mock",
+    });
+
+    await drainHandle(handle);
+
+    const runAfter = await client.runs.get(handle.runId);
+    expect(runAfter.usage).toEqual({
+      inputTokens: 200,
+      outputTokens: 50,
+    });
+  });
+
   test("all normalized events are stored", async () => {
     const { client } = createTestPlatform({
       adapters: [

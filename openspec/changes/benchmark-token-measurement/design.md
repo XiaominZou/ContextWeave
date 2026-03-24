@@ -1,151 +1,126 @@
 ## Context
 
 ### 背景
-Context Platform V1 当前实现了事件观察功能，但 `context=inject` 和 `memory=platform` 被 `validateFeatureAvailability()` 阻塞，返回 `NOT_ENABLED`。为了验证平台的核心价值（token 节省），需要先设计 benchmark 框架，然后在启用这些功能前后分别测量。
 
-### 当前状态
-- `run.usage` 事件在 `events.ts` 中已定义，但 adapter 层未实现上报
-- Memory 系统的 provider 和 engine 在 `testing/src/in-memory-memory.ts` 中已实现
-- Context snapshot 构建在 `client/src/internal/memory-context-snapshot.ts` 中已实现
-- 但 `run-runtime.ts` 会拒绝任何非 native 模式
+我们需要一个能直接回答下面问题的 benchmark：
 
-### 约束
-- Benchmark 必须公平：两组完成度分差 ≤ 5 分
-- 任务结果必须可量化：pytest 通过率
-- 需要体现两个优势点：context 过滤 + memory 注入
+`在完成度基本不变的前提下，Context Platform 能否显著降低 agent 的 token 消耗？`
+
+因此设计重点应是控制变量，而不是一次性展示平台的全部能力。
+
+### 当前约束
+
+- `run.usage` 事件已定义，但真实 token 上报仍需补齐
+- `context=inject` 和 `memory=platform` 目前尚未完全开放
+- benchmark 需要先支持早期模拟验证，再支持真实运行
 
 ## Goals / Non-Goals
 
-**Goals:**
-1. 设计一个 8-12 轮 LLM 调用的长程任务，能产生上下文膨胀
-2. 实现四种执行模式的对比（Baseline / Platform+Context / Platform+Context+Memory-sim / Platform+Context+Memory-real）
-3. 建立 token 计量体系，精确记录每次 LLM 调用的 input/output token，包括 memoryExtractionTokens
-4. 定义客观的完成度评分标准
-5. 量化"浪费工具调用"（wasted calls）以体现 memory 价值
+### Goals
 
-**Non-Goals:**
-1. 不实现 embedding 向量检索（V1.1 之后）
-2. 不实现 session-level preload（V1.1 之后）
-3. 不实现 task freshness 缓存
-4. 不在本 change 中启用 `context=inject` 和 `memory=platform`（那是 v1.1-context-injection 和 v1.1-memory-platform 的任务）
+1. 设计一个会自然产生上下文膨胀的 8-12 轮任务
+2. 让主 benchmark 只回答 context 和 memory 带来的 token 变化
+3. 建立可复核的 token 计量和 completion 校验
+4. 让结果可重复，避免单次 run 偶然性
+
+### Non-Goals
+
+1. 不在主 benchmark 中展示 task graph 并行收益
+2. 不把 C-sim 作为主结论来源
+3. 不在本 change 中实现 embedding 检索等后续能力
 
 ## Decisions
 
-### D1: 任务选择 - MiniKanban FastAPI Service
+### D1: 单一主任务，保留轻量实现
 
-**选择**: 使用 FastAPI + pytest 实现看板 API
+选择 MiniKanban FastAPI Service 作为唯一主 fixture。
 
-**理由**:
-- 跨文件修改（models/routes/tests）
-- 多轮需求变更（Phase 1-4）
-- 有业务规则需要"记住"（done 状态不可改标题、标签限制）
-- pytest 提供客观 pass/fail 验收
-- 工程上真实，有代表性
+理由：
+- 足够长，能产生上下文膨胀
+- 有真实多轮开发和修复过程
+- pytest 可提供客观完成度
+- 目前先做一个高质量任务，比同时做多套 fixture 更轻
 
-**替代方案**:
-- CLI 工具：缺乏 API 测试的标准化
-- 前端组件：测试环境复杂，难以量化
-- 纯算法题：太短，无法产生上下文膨胀
+### D2: 主 benchmark 只保留三种必跑模式
 
-### D2: 四种模式分层对比
+- Mode A: Baseline = `context=native`, `memory=off`
+- Mode B: Platform+Context = `context=inject`, `memory=off`
+- Mode C-real: Platform+Context+Memory = `context=inject`, `memory=platform`
 
-**选择**: 
-- Mode A (Baseline): context=native, memory=off
-- Mode B (Platform+Context): context=inject, memory=off  
-- Mode C-sim (Platform+Context+Memory-sim): context=inject, memory=platform, 确定性提取
-- Mode C-real (Platform+Context+Memory-real): context=inject, memory=platform, LLM 提取
+说明：
+- A vs B 是主对照，回答 context pruning 是否省 token
+- B vs C-real 是次对照，回答 memory 在真实成本下是否继续省 token
+- C-sim 只保留为可选辅助模式，不进入主对外结论
 
-**理由**: 分层设计能独立验证两个优势点和提取成本
-- Mode B vs A: 验证 context 过滤节省
-- Mode C-sim vs B: 验证 memory 注入的理论上限节省
-- Mode C-real vs C-sim: 量化 memory 提取的 LLM 成本
-- Mode C-real vs B: 验证真实场景下的净节省
+### D3: 主 benchmark 统一串行执行
 
-### D3: Memory 提取策略 - C-sim 和 C-real 双轨制
+所有模式都按同一组 10 轮指令串行执行。
 
-**选择**: 提供 C-sim（确定性提取）和 C-real（LLM 提取）两种子模式
+说明：
+- 不在主 benchmark 中让平台组并行、baseline 串行
+- 否则结论会混入 task graph 调度收益
+- 如果后续要展示 task graph 价值，应单独做附加 benchmark
 
-**C-sim (Simulated)**:
-- 使用基于规则的确定性提取，不调用 LLM
-- 结果代表"理论上限"
-- 适合验证框架正确性和快速迭代
+### D4: 完成度校验采用双门槛
 
-**C-real (Realistic)**:
-- 使用 LLM 进行 memory 提取
-- 计入 `memoryExtractionTokens` 成本
-- 结果代表"真实场景下的净节省"
+只有同时满足以下条件才允许比较 token：
 
-**理由**:
-- C-sim 用于早期验证和开发调试
-- C-real 用于生产环境真实评估
-- 两者对比可以量化 memory 提取的 LLM 成本
+1. hidden tests 通过数差异不超过 1
+2. completion score 总分差异不超过 5
 
-**已决策**: "浪费工具调用"定义为"当 availableMemoryIds 非空时仍重复执行相同 inputSignature 的 tool call"
+理由：
+- 保留整体质量约束
+- 同时把“精度不受影响”更直接地绑定到隐藏测试
 
-### D4: 隐藏测试设计
+### D5: 结果默认按重复运行汇总
 
-**选择**: 12 个隐藏测试，覆盖边界条件和业务规则
+每个模式默认至少跑 5 次，报告：
+- median total input tokens
+- median total output tokens
+- median R6-R10 average input tokens
+- median completion score
+- p25 / p75 作为波动范围
 
-**内容**:
-- 边界条件（空标签、超过 5 个标签、重复标签）
-- 业务规则违反（done 状态改标题、级联删除验证）
-- 错误处理（不存在的 board/task ID）
+理由：
+- 单次 run 容易受模型随机性影响
+- 5 次已经是较轻量但足够明显的下限
 
-**理由**: 防止 agent 针对公开测试过拟合
+### D6: Token 计量优先使用 LLM API proxy interceptor
 
-### D5: Token 计量来源
+优先使用 proxy 拦截真实 API 响应中的 usage 字段。
 
-**选择**: 优先使用 LLM API proxy interceptor
+理由：
+- 比 adapter 日志更通用
+- 计量边界更清晰
 
-**理由**:
-- 更通用，不依赖 adapter 实现
-- 精确，直接从 API 响应获取
+### D7: Wasted calls 作为辅助指标
 
-**备选**: 在各 adapter 的 normalizeEvent() 中解析并 emit `run.usage`
+`wasted call` 保留，但只作为辅助分析，不作为主结论。
+
+原因：
+- “有 memory 仍再次读取”不总等于浪费
+- 该指标适合帮助解释行为，不适合作为核心 ROI 证据
 
 ## Risks / Trade-offs
 
-### R1: run.usage 未实现
-**风险**: adapter 层未上报 token 使用量，无法计量
-**缓解**: 
-1. 优先方案：实现 LLM API proxy interceptor
-2. 备选：在 OpenCode adapter 中解析输出并 emit `run.usage`
+### R1: 只有一个 fixture，外推性有限
 
-### R2: Mode B/C 功能未启用
-**风险**: `validateFeatureAvailability()` 阻塞非 native 模式
-**缓解**: 
-1. 先用 RawMockAdapter 模拟验证框架正确性
-2. 在 v1.1-context-injection change 中移除限制
+缓解：
+- 明确这是 V1 benchmark
+- 对外表述为“代表性长程编码任务”，而非“通用结论已完全证明”
 
-### R3: 预期节省数据不可靠
-**风险**: -41%、-57% 的预估值缺乏依据
-**缓解**: 在报告中明确标注为"待验证"，不作为承诺
+### R2: Mode B/C 功能尚未完全开放
 
-### R4: Memory 提取成本被忽略（已通过 C-real 模式解决）
+缓解：
+- 先用 RawMockAdapter 验证 harness 和 analyzer
+- 待能力开放后再跑真实结果
 
-~~**风险**: 确定性提取不反映真实场景的 LLM 成本~~
-**解决方案**: 提供 C-real 模式，使用 LLM 提取并计入 memoryExtractionTokens
+### R3: 重复运行增加成本
 
-### R5: ~~双层 session-task 图未体现~~（已解决）
-
-~~**风险**: 10 轮指令是线性的，未体现 task graph 的层级调度~~
-**解决方案**: 已在 D7 中决策，R5 拆分为两个并行子任务
-
-### D6: 隐藏测试具体内容
-
-**已决策**: 12 个隐藏测试已在 benchmark-plan.md 中详细定义，覆盖：
-- 边界条件（空标签列表、超过 5 个标签、重复标签）
-- 业务规则违反（done 状态改标题、级联删除验证）
-- 错误处理（不存在的 board/task ID）
-
-### D7: R5 并行子任务设计
-
-**已决策**: R5 拆分为两个并行子任务：
-- T3.1: 实现级联删除（DELETE /boards/{id}）
-- T3.2: 补充级联删除测试
-
-这体现了"双层 session-task 图"的优势：父任务完成基础实现后，子任务可并行执行。
+缓解：
+- 默认 5 次，不做过重统计设计
+- 本地调试可先跑 1 次 smoke
 
 ## Open Questions
 
-1. **embedding 向量检索**: V1.1 是否需要实现？还是继续用文本匹配？
+1. V1 是否需要再补一个不同形态的 fixture，还是先用单 fixture 跑通完整链路
