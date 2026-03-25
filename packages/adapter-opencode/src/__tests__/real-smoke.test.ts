@@ -9,6 +9,7 @@ const OPENCODE_CMD = "C:\\Users\\zxm\\AppData\\Roaming\\npm\\opencode.cmd";
 const realSmoke = process.env.CTX_ENABLE_REAL_OPENCODE_SMOKE === "1" ? test : test.skip;
 const capabilitySmoke = process.env.CTX_ENABLE_REAL_OPENCODE_CAPABILITY_SMOKE === "1" ? test : test.skip;
 const hostSmoke = process.env.CTX_ENABLE_REAL_OPENCODE_HOST_SMOKE === "1" ? test : test.skip;
+const usageSmoke = process.env.CTX_ENABLE_REAL_OPENCODE_USAGE_SMOKE === "1" ? test : test.skip;
 
 describe("OpenCodeAdapter real smoke", () => {
   capabilitySmoke(
@@ -171,6 +172,7 @@ describe("OpenCodeAdapter real smoke", () => {
       platform.runtime.adapters.register(
         new OpenCodeHostAdapter({
           binaryPath: OPENCODE_CMD,
+          agent: "general",
           cwd: process.cwd(),
         }),
       );
@@ -294,6 +296,50 @@ describe("OpenCodeAdapter real smoke", () => {
         .join("");
 
       expect(deltaTexts.trim().length).toBeGreaterThan(0);
+    },
+    180000,
+  );
+
+  usageSmoke(
+    "captures token usage from a real opencode run",
+    async () => {
+      const store = new InMemoryStore();
+      const platform = createContextPlatform({ store });
+      platform.runtime.adapters.register(
+        new OpenCodeAdapter({
+          binaryPath: OPENCODE_CMD,
+          cwd: process.cwd(),
+        }),
+      );
+
+      const client = platform.client();
+      const session = await client.sessions.create({
+        workspaceId: "ws_smoke",
+        title: "real opencode usage smoke",
+      });
+      const task = await client.tasks.create({
+        workspaceId: "ws_smoke",
+        sessionId: session.id,
+        title: "Usage smoke run",
+        objective: "Verify token usage reporting",
+      });
+
+      const handle = await client.runs.start({
+        workspaceId: "ws_smoke",
+        sessionId: session.id,
+        taskId: task.id,
+        adapter: "opencode",
+        metadata: {
+          prompt: "Reply with exactly one short word.",
+        },
+      });
+
+      const events = await collectEventsWithTimeout(handle, 90000);
+      const run = await client.runs.get(handle.runId);
+
+      expect(run.status).toBe("completed");
+      expect(events.some((event) => event.type === "run.usage")).toBe(true);
+      expect((run.usage?.inputTokens ?? 0) + (run.usage?.outputTokens ?? 0)).toBeGreaterThan(0);
     },
     180000,
   );

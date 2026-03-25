@@ -116,11 +116,22 @@ describe('OpenCodeHostAdapter transparent host path', () => {
     const normalized = await collectNormalizedEvents(adapter, handle);
     expect(normalized.map((event) => event.type)).toEqual([
       'run.started',
+      'run.usage',
       'tool.call',
       'tool.result',
       'message.delta',
       'run.completed',
     ]);
+    expect(normalized[1]?.payload).toMatchObject({
+      inputTokens: 432,
+      outputTokens: 54,
+      cacheReadInputTokens: 33,
+      cacheWriteInputTokens: 0,
+    });
+    expect(normalized[2]?.payload).toMatchObject({
+      name: 'platform_task_update',
+      input: { note: 'fake tool call' },
+    });
   });
 });
 

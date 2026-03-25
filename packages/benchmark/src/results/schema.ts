@@ -21,6 +21,8 @@ export interface LlmCallRecord {
   purpose: "plan" | "patch" | "debug" | "summarize" | "other";
   inputTokens: number;
   outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheWriteInputTokens?: number;
   totalTokens: number;
   timestamp: string;
   contextBreakdown?: ContextBreakdown;
@@ -32,6 +34,7 @@ export interface ToolUseRecord {
   round: number;
   toolName: string;
   inputSignature: string;
+  timestamp: string;
   isError: boolean;
   availableMemoryIds: string[];
   yieldedNewInformation?: boolean;
@@ -57,6 +60,17 @@ export interface CompletionScore {
   processPoints: number;
 }
 
+export interface BenchmarkRoundDiagnostics {
+  round: number;
+  purpose: LlmCallRecord["purpose"];
+  snapshotTokenEstimate: number;
+  includedBlockCount: number;
+  excludedBlockCount: number;
+  promptTextLength: number;
+  sourceTypeCounts: Record<string, number>;
+  retentionCounts: Record<string, number>;
+}
+
 export interface BenchmarkRunResult {
   mode: BenchmarkMode;
   iteration: number;
@@ -64,6 +78,7 @@ export interface BenchmarkRunResult {
   toolCalls: ToolUseRecord[];
   wastedCalls: WastedCallRecord[];
   completion: CompletionScore;
+  roundDiagnostics?: BenchmarkRoundDiagnostics[];
 }
 
 export interface MetricSpread {
@@ -76,10 +91,18 @@ export interface BenchmarkModeSummary {
   mode: BenchmarkMode;
   repeatCount: number;
   totalInputTokens: MetricSpread;
+  totalCacheReadInputTokens: MetricSpread;
+  totalInputTokensWithCache: MetricSpread;
   totalOutputTokens: MetricSpread;
   averageInputTokensR6ToR10: MetricSpread;
+  averageInputTokensWithCacheR6ToR10: MetricSpread;
   completionScore: MetricSpread;
   totalLlmCalls: MetricSpread;
+  totalToolCalls: MetricSpread;
+  readToolCalls: MetricSpread;
+  distinctReadTargets: MetricSpread;
+  repeatedReadCallRatio: MetricSpread;
+  bashToolCalls: MetricSpread;
   wastedToolCallRatio: MetricSpread;
   memoryExtractionTokens: MetricSpread;
 }

@@ -50,7 +50,22 @@ if (scenario === "success") {
   const systemText = await loadSystemText();
   emit({ type: "run_started", sessionId: "oc_session_test", model: "gpt-test" });
   emit({ type: "text", text: `echo:${systemText ? `${systemText}\n` : ""}${prompt}` });
-  emit({ type: "message_stop", stop_reason: "end_turn" });
+  emit({
+    type: "step_finish",
+    part: {
+      reason: "end_turn",
+      tokens: {
+        input: 321,
+        output: 45,
+        total: 366,
+        cache: {
+          read: 17,
+          write: 0,
+        },
+      },
+    },
+  });
+  emit({ type: "run_completed", reason: "end_turn" });
   process.exit(0);
 }
 
@@ -63,6 +78,11 @@ if (scenario === "invalid-json") {
 if (scenario === "non-zero") {
   process.stderr.write("boom from fake opencode");
   process.exit(2);
+}
+
+if (scenario === "stderr-zero") {
+  process.stderr.write("error: Unable to connect. Is the computer able to access the url?\n  path: \"http://127.0.0.1:4317/v1/chat/message\",\n errno: 0,\n  code: \"ConnectionRefused\"\n");
+  process.exit(0);
 }
 
 process.stderr.write(`unknown scenario: ${scenario}`);

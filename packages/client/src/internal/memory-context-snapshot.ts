@@ -21,6 +21,8 @@ import { readRunSummary, readTaskSummary } from "./task-derived-context";
 
 const DEFAULT_MEMORY_RESULT_LIMIT = 5;
 const DEFAULT_RUN_SUMMARY_LIMIT = 3;
+const DEFAULT_CONTEXT_TOKEN_BUDGET = 900;
+const SUMMARY_ONLY_PROMPT_TOKEN_BUDGET = 64;
 
 interface ContextCollectorInput {
   run: Run;
@@ -59,8 +61,9 @@ export async function buildContextSnapshot(input: ContextCollectorInput): Promis
     task: input.task,
     blocks: collected.flat(),
   });
-  const blocks = selection.included;
-  const totalTokens = blocks.reduce((sum, block) => sum + (block.tokenEstimate ?? 0), 0);
+  const budgeted = applyContextTokenBudget(selection.included, input.task.id);
+  const blocks = budgeted.included;
+  const totalTokens = blocks.reduce((sum, block) => sum + estimatePromptTokens(block), 0);
   const createdAt = new Date().toISOString();
 
   return {
@@ -74,9 +77,9 @@ export async function buildContextSnapshot(input: ContextCollectorInput): Promis
       included: blocks.map((block) => ({
         blockId: block.id,
         reason: renderInclusionReason(block),
-        tokens: block.tokenEstimate ?? 0,
+        tokens: estimatePromptTokens(block),
       })),
-      excluded: selection.excluded,
+      excluded: [...selection.excluded, ...budgeted.excluded],
       totalTokens,
     },
     createdAt,
@@ -163,6 +166,10 @@ async function collectDependencyTaskSummaryBlocks(input: ContextCollectorInput):
 }
 
 async function collectRunSummaryBlocks(input: ContextCollectorInput): Promise<ContextBlock[]> {
+  if (input.policy.contextHints?.suppressRunSummaries) {
+    return [];
+  }
+
   const summaries = input.store
     .listRunsByTask(input.task.id)
     .filter((run) => run.id !== input.run.id)
@@ -385,6 +392,59 @@ function renderInclusionReason(block: ContextBlock): string {
   const reason = String(block.metadata?.["inclusionReason"] ?? "context block included");
   const retention = typeof block.metadata?.["retentionAction"] === "string" ? String(block.metadata?.["retentionAction"]) : undefined;
   return retention ? `${reason} (${retention})` : reason;
+}
+
+function applyContextTokenBudget(
+  blocks: ContextBlock[],
+  currentTaskId: string,
+): {
+  included: ContextBlock[];
+  excluded: Array<{ sourceRef: string; reason: string }>;
+} {
+  const mandatory = blocks.filter((block) => isMandatoryBlock(block, currentTaskId));
+  const optional = blocks.filter((block) => !isMandatoryBlock(block, currentTaskId));
+  const included = [...mandatory];
+  const excluded: Array<{ sourceRef: string; reason: string }> = [];
+  let usedTokens = included.reduce((sum, block) => sum + estimatePromptTokens(block), 0);
+
+  for (const block of optional) {
+    const blockTokens = estimatePromptTokens(block);
+    if (usedTokens + blockTokens <= DEFAULT_CONTEXT_TOKEN_BUDGET) {
+      included.push(block);
+      usedTokens += blockTokens;
+      continue;
+    }
+
+    excluded.push({
+      sourceRef: block.sourceRef,
+      reason: `context token budget exceeded (${usedTokens + blockTokens} > ${DEFAULT_CONTEXT_TOKEN_BUDGET})`,
+    });
+  }
+
+  return { included, excluded };
+}
+
+function isMandatoryBlock(block: ContextBlock, currentTaskId: string): boolean {
+  const sourceType = typeof block.metadata?.["sourceType"] === "string"
+    ? String(block.metadata["sourceType"])
+    : undefined;
+  const sourceTaskId = typeof block.metadata?.["sourceTaskId"] === "string"
+    ? String(block.metadata["sourceTaskId"])
+    : undefined;
+  return sourceType === "task" && sourceTaskId === currentTaskId;
+}
+
+function estimatePromptTokens(block: ContextBlock): number {
+  const baseTokens = block.tokenEstimate ?? estimateTokens(block.content);
+  const retentionAction = typeof block.metadata?.["retentionAction"] === "string"
+    ? String(block.metadata["retentionAction"])
+    : "expand";
+
+  if (retentionAction !== "summary-only") {
+    return baseTokens;
+  }
+
+  return Math.min(baseTokens, SUMMARY_ONLY_PROMPT_TOKEN_BUDGET);
 }
 
 function sortRunByRecency(run: Run): string {

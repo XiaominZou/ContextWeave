@@ -4,5 +4,6 @@ export * from "./memory-channel-rules";
 export * from "./memory-engine";
 export * from "./memory-provider";
 export * from "./memory-validation";
+export * from "./path-normalization";
 export * from "./policies";
 export * from "./types";

@@ -13,11 +13,13 @@ import type {
   ResumeRunInput,
 } from "@ctx/adapter-kit";
 import { buildPlatformMemoryMcpServers, buildPlatformTaskMcpServers } from "@ctx/adapter-kit";
+import { renderSnapshotToPromptText } from "./context-render";
 import { prepareTransparentPluginOverlay } from "./opencode-transparent-plugin";
 
 export interface OpenCodeAdapterOptions {
   binaryPath?: string;
   binaryArgs?: string[];
+  agent?: string;
   cwd?: string;
   env?: Record<string, string>;
 }
@@ -30,6 +32,11 @@ interface WrappedRawEvent {
     runId: string;
   };
   event: unknown;
+}
+
+interface ProcessStreamState {
+  sawStructuredOutput: boolean;
+  sawExplicitTerminal: boolean;
 }
 
 class AsyncQueue<T> {
@@ -99,7 +106,11 @@ export class OpenCodeAdapter implements AgentAdapter {
   async renderContext(input: RenderContextInput): Promise<AdapterPayload> {
     const prompt = buildPrompt(input);
     const argv = ["run", "--format", "json", prompt];
-    const platformContext = input.policy.context === "native" ? undefined : renderSnapshotToText(input.snapshot);
+    const platformContext = input.policy.context === "native" ? undefined : renderSnapshotToPromptText(input.snapshot);
+
+    if (this.options.agent) {
+      argv.splice(1, 0, "--agent", this.options.agent);
+    }
 
     if (input.run.model) {
       argv.splice(2, 0, "--model", input.run.model);
@@ -156,9 +167,13 @@ export class OpenCodeAdapter implements AgentAdapter {
       taskId: input.run.taskId,
       runId: input.run.id,
     };
+    const streamState: ProcessStreamState = {
+      sawStructuredOutput: false,
+      sawExplicitTerminal: false,
+    };
 
-    attachJsonLineReader(child, context, queue);
-    attachProcessExit(child, context, queue, cleanupOverlay);
+    attachJsonLineReader(child, context, queue, streamState);
+    attachProcessExit(child, context, queue, streamState, cleanupOverlay);
 
     if (input.payload.stdin) {
       child.stdin.write(input.payload.stdin);
@@ -265,8 +280,13 @@ export class OpenCodeAdapter implements AgentAdapter {
               readNestedString(event.part, "toolCallID") ??
               readNestedString(event.part, "callID") ??
               "call_unknown",
-            name: readString(event.name) ?? readNestedString(event.part, "name") ?? "unknown_tool",
-            input: event.input ?? event.arguments ?? readNestedValue(event.part, "input") ?? {},
+            name: readString(event.name) ?? readString(event.tool) ?? readNestedString(event.part, "tool") ?? readNestedString(event.part, "name") ?? "unknown_tool",
+            input:
+              event.input ??
+              event.arguments ??
+              readNestedValue(event.part, "input") ??
+              readNestedValue(readNestedValue(event.part, "state"), "input") ??
+              {},
           },
         };
       case "tool_result":
@@ -286,8 +306,26 @@ export class OpenCodeAdapter implements AgentAdapter {
             isError: readBoolean(event.isError) ?? readNestedBoolean(event.part, "isError") ?? false,
           },
         };
-      case "step_finish":
-      case "step-finish":
+      case "usage":
+      case "run.usage":
+        return {
+          ...base,
+          type: "run.usage",
+          payload: {
+            inputTokens:
+              readNumber(event.inputTokens) ??
+              readNumber(event.input_tokens) ??
+              readNestedNumber(event.usage, "inputTokens") ??
+              readNestedNumber(event.usage, "input_tokens"),
+            outputTokens:
+              readNumber(event.outputTokens) ??
+              readNumber(event.output_tokens) ??
+              readNestedNumber(event.usage, "outputTokens") ??
+              readNestedNumber(event.usage, "output_tokens"),
+            cacheReadInputTokens: readUsageCacheReadTokens(event),
+            cacheWriteInputTokens: readUsageCacheWriteTokens(event),
+          },
+        };
       case "message_stop":
       case "run_completed":
       case "run.completed":
@@ -342,17 +380,11 @@ function buildPrompt(input: RenderContextInput): string {
     : `Run task ${input.run.id}`;
 }
 
-function renderSnapshotToText(snapshot: RenderContextInput["snapshot"]): string {
-  if (!snapshot) {
-    return "";
-  }
-  return snapshot.blocks.map((block) => block.content).join("\n");
-}
-
 function attachJsonLineReader(
   child: ChildProcessWithoutNullStreams,
   context: WrappedRawEvent["context"],
   queue: AsyncQueue<WrappedRawEvent>,
+  state: ProcessStreamState,
 ): void {
   const stdout = createInterface({ input: child.stdout });
   stdout.on("line", (line) => {
@@ -363,7 +395,17 @@ function attachJsonLineReader(
     }
 
     try {
-      queue.push({ context, event: JSON.parse(trimmed) });
+      const parsed = JSON.parse(trimmed);
+      state.sawStructuredOutput = true;
+      const parsedType = isRecord(parsed) ? readString(parsed.type) : undefined;
+      if (parsedType === "message_stop" || parsedType === "run_completed" || parsedType === "run.completed") {
+        state.sawExplicitTerminal = true;
+      }
+      const usageEvent = extractUsageEvent(parsed);
+      if (usageEvent) {
+        queue.push({ context, event: usageEvent });
+      }
+      queue.push({ context, event: parsed });
     } catch {
       queue.push({
         context,
@@ -377,10 +419,57 @@ function attachJsonLineReader(
   });
 }
 
+function extractUsageEvent(event: unknown): Record<string, unknown> | null {
+  if (!isRecord(event)) {
+    return null;
+  }
+
+  const directUsage = isRecord(event.usage) ? event.usage : undefined;
+  if (directUsage) {
+    return { type: "run.usage", usage: directUsage };
+  }
+
+  const nestedTokens = isRecord(event.part) && isRecord(event.part.tokens) ? event.part.tokens : undefined;
+  if (!nestedTokens) {
+    return null;
+  }
+
+  const inputTokens =
+    readNumber(nestedTokens.input) ??
+    readNumber(nestedTokens.input_tokens);
+  const outputTokens =
+    readNumber(nestedTokens.output) ??
+    readNumber(nestedTokens.output_tokens);
+  const cacheReadInputTokens =
+    readNestedNumber(nestedTokens.cache, "read") ??
+    readNestedNumber(nestedTokens.cache, "read_tokens");
+  const cacheWriteInputTokens =
+    readNestedNumber(nestedTokens.cache, "write") ??
+    readNestedNumber(nestedTokens.cache, "write_tokens");
+
+  if (
+    typeof inputTokens !== "number" &&
+    typeof outputTokens !== "number" &&
+    typeof cacheReadInputTokens !== "number" &&
+    typeof cacheWriteInputTokens !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    type: "run.usage",
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens,
+    cacheWriteInputTokens,
+  };
+}
+
 function attachProcessExit(
   child: ChildProcessWithoutNullStreams,
   context: WrappedRawEvent["context"],
   queue: AsyncQueue<WrappedRawEvent>,
+  state: ProcessStreamState,
   cleanup?: () => Promise<void>,
 ): void {
   let stderr = "";
@@ -407,13 +496,22 @@ function attachProcessExit(
 
   child.on("close", (code, signal) => {
     debug("process-close", { code, signal });
-    if (code && code !== 0) {
+    const stderrMessage = extractProcessFailureMessage(stderr);
+    if ((code && code !== 0) || stderrMessage) {
       queue.push({
         context,
         event: {
           type: "error",
-          code: "PROCESS_EXIT_NON_ZERO",
-          message: stderr || `OpenCode exited with code ${code}${signal ? ` (signal: ${signal})` : ""}`,
+          code: stderrMessage ? "PROCESS_EXIT_ERROR" : "PROCESS_EXIT_NON_ZERO",
+          message: stderrMessage ?? (stderr || `OpenCode exited with code ${code}${signal ? ` (signal: ${signal})` : ""}`),
+        },
+      });
+    } else if (state.sawStructuredOutput && !state.sawExplicitTerminal) {
+      queue.push({
+        context,
+        event: {
+          type: "run.completed",
+          reason: "process_exit",
         },
       });
     }
@@ -469,11 +567,22 @@ function readBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function readNestedString(value: unknown, key: string): string | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
   return readString(value[key]);
+}
+
+function readNestedNumber(value: unknown, key: string): number | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  return readNumber(value[key]);
 }
 
 function readNestedBoolean(value: unknown, key: string): boolean | undefined {
@@ -490,12 +599,51 @@ function readNestedValue(value: unknown, key: string): unknown {
   return value[key];
 }
 
+function readUsageCacheReadTokens(event: Record<string, unknown>): number | undefined {
+  return (
+    readNumber(event.cacheReadInputTokens) ??
+    readNumber(event.cache_read_input_tokens) ??
+    readNestedNumber(event.usage, "cacheReadInputTokens") ??
+    readNestedNumber(event.usage, "cache_read_input_tokens") ??
+    readNestedNumber(readNestedValue(event.usage, "cache"), "read") ??
+    readNestedNumber(readNestedValue(event.usage, "cache"), "read_tokens")
+  );
+}
+
+function readUsageCacheWriteTokens(event: Record<string, unknown>): number | undefined {
+  return (
+    readNumber(event.cacheWriteInputTokens) ??
+    readNumber(event.cache_write_input_tokens) ??
+    readNestedNumber(event.usage, "cacheWriteInputTokens") ??
+    readNestedNumber(event.usage, "cache_write_input_tokens") ??
+    readNestedNumber(readNestedValue(event.usage, "cache"), "write") ??
+    readNestedNumber(readNestedValue(event.usage, "cache"), "write_tokens")
+  );
+}
+
 function debug(label: string, value: unknown): void {
   if (process.env.CTX_DEBUG_OPENCODE !== "1") {
     return;
   }
   const rendered = typeof value === "string" ? value : JSON.stringify(value);
   console.error(`[opencode-adapter] ${label}: ${rendered}`);
+}
+
+function extractProcessFailureMessage(stderr: string): string | undefined {
+  const trimmed = stderr.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (/\bUnable to connect\b/i.test(trimmed) || /\bConnectionRefused\b/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/^error:/im.test(trimmed)) {
+    return trimmed;
+  }
+
+  return undefined;
 }
 
 

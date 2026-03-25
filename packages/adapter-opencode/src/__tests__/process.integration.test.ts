@@ -5,10 +5,45 @@ import { describe, expect, test } from "vitest";
 import { defaultCapabilityPolicy, type AgentEventEnvelope, type Run } from "@ctx/core";
 import { PLATFORM_MEMORY_MCP_SERVER } from "@ctx/adapter-kit";
 import { OpenCodeAdapter } from "../opencode-adapter";
+import { renderSnapshotToPromptText } from "../context-render";
 
 const fakeCliPath = fileURLToPath(new URL("./fixtures/fake-opencode.mjs", import.meta.url));
 
 describe("OpenCodeAdapter createRun()", () => {
+  test("renders summary-only blocks as compact prompt entries", () => {
+    const rendered = renderSnapshotToPromptText({
+      id: "ctx_summary_only",
+      workspaceId: "ws_test",
+      sessionId: "sess_test",
+      blocks: [
+        {
+          id: "b1",
+          kind: "task",
+          title: "Primary task",
+          content: "Keep the full task block visible.",
+          sourceRef: "task_1",
+          tokenEstimate: 8,
+          metadata: { retentionAction: "expand" },
+        },
+        {
+          id: "b2",
+          kind: "message",
+          title: "Prior run summary",
+          content: "This is a verbose summary block that should be compacted when rendered for prompt injection because it is only summary-only context.",
+          sourceRef: "run_1",
+          tokenEstimate: 24,
+          metadata: { retentionAction: "summary-only" },
+        },
+      ],
+      tokenEstimate: 32,
+      createdAt: new Date().toISOString(),
+    });
+
+    expect(rendered).toContain("Keep the full task block visible.");
+    expect(rendered).toContain("[message] Prior run summary");
+    expect(rendered).not.toContain("\nThis is a verbose summary block that should be compacted when rendered for prompt injection because it is only summary-only context.\n");
+  });
+
   test("spawns a CLI process and normalizes streamed JSON lines", async () => {
     const adapter = new OpenCodeAdapter({
       binaryPath: process.execPath,
@@ -38,12 +73,19 @@ describe("OpenCodeAdapter createRun()", () => {
     expect(normalized.map((event) => event.type)).toEqual([
       "run.started",
       "message.delta",
+      "run.usage",
       "run.completed",
     ]);
     expect(normalized[0]?.payload).toMatchObject({ externalRef: "oc_session_test" });
     expect(normalized[1]?.payload).toMatchObject({
       role: "assistant",
       text: "echo:Write hello world",
+    });
+    expect(normalized[2]?.payload).toMatchObject({
+      inputTokens: 321,
+      outputTokens: 45,
+      cacheReadInputTokens: 17,
+      cacheWriteInputTokens: 0,
     });
   });
 
@@ -180,6 +222,38 @@ describe("OpenCodeAdapter createRun()", () => {
       error: {
         code: "PROCESS_EXIT_NON_ZERO",
         message: "boom from fake opencode",
+      },
+    });
+  });
+
+  test("turns stderr-only connection failures into run.failed events", async () => {
+    const adapter = new OpenCodeAdapter({
+      binaryPath: process.execPath,
+      binaryArgs: [fakeCliPath],
+      env: { OPENCODE_FAKE_SCENARIO: "stderr-zero" },
+    });
+
+    const run = buildRunFixture();
+    const payload = await adapter.renderContext({
+      snapshot: null,
+      policy: defaultCapabilityPolicy,
+      run,
+    });
+
+    const handle = await adapter.createRun({
+      run,
+      payload,
+      policy: defaultCapabilityPolicy,
+    });
+
+    const normalized = await collectNormalizedEvents(adapter, handle);
+
+    expect(normalized).toHaveLength(1);
+    expect(normalized[0]?.type).toBe("run.failed");
+    expect(normalized[0]?.payload).toMatchObject({
+      error: {
+        code: "PROCESS_EXIT_ERROR",
+        message: expect.stringContaining("ConnectionRefused"),
       },
     });
   });

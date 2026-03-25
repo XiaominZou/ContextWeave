@@ -19,7 +19,15 @@ export type CoreAgentEvent =
   | { type: "run.completed"; payload: { reason?: string } }
   | { type: "run.failed"; payload: { error: SerializedError } }
   | { type: "run.cancelled"; payload: { reason?: string } }
-  | { type: "run.usage"; payload: { inputTokens?: number; outputTokens?: number } }
+  | {
+      type: "run.usage";
+      payload: {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheWriteInputTokens?: number;
+      };
+    }
   | { type: "message.delta"; payload: { role: "assistant"; text: string } }
   | { type: "message.completed"; payload: { messageId: string } }
   | { type: "tool.call"; payload: { callId: string; name: string; input: unknown } }

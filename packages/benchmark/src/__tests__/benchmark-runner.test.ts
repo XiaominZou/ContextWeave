@@ -9,6 +9,7 @@ describe("runBenchmark()", () => {
     expect(output.analysis.summaries).toHaveLength(3);
     expect(output.analysis.summaries.find((summary) => summary.mode === "baseline")?.repeatCount).toBe(2);
     expect(output.analysis.summaries.find((summary) => summary.mode === "baseline")?.totalInputTokens.median).toBeGreaterThan(0);
+    expect(output.analysis.summaries.find((summary) => summary.mode === "baseline")?.totalInputTokensWithCache.median).toBeGreaterThan(0);
     expect(output.analysis.fairness.every((item) => item.check.valid)).toBe(true);
   });
 });

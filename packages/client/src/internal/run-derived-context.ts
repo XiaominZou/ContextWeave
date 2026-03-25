@@ -1,4 +1,4 @@
-import type { AgentEventEnvelope, Run } from "@ctx/core";
+import { normalizeContextFilePath, type AgentEventEnvelope, type Run } from "@ctx/core";
 import { extractArtifactIds } from "./artifact-records";
 
 export const RUN_SUMMARY_METADATA_KEY = "platformRunSummary";
@@ -12,6 +12,7 @@ export interface RunSummaryV1 {
   messageCount: number;
   toolCallCount: number;
   indexedToolCallCount: number;
+  readFilePaths: string[];
   assistantOutputPreview?: string;
   errorCode?: string;
   errorMessage?: string;
@@ -82,6 +83,7 @@ export function buildRunDerivedContext(input: {
   const toolCallRefs = [...toolCalls.values()]
     .map((callEvent) => buildToolCallRef(callEvent, toolResults.get(readString(callEvent.payload, "callId") ?? "")))
     .filter((value): value is ToolCallRefV1 => Boolean(value));
+  const readFilePaths = collectReadFilePaths(toolCalls, toolResults);
 
   const assistantOutputPreview = truncate(joinAssistantOutput(assistantChunks), 240);
   return {
@@ -93,6 +95,7 @@ export function buildRunDerivedContext(input: {
       messageCount: input.events.filter((event) => event.type === "message.delta").length,
       toolCallCount: toolCalls.size,
       indexedToolCallCount: toolCallRefs.length,
+      readFilePaths,
       assistantOutputPreview: assistantOutputPreview || undefined,
       errorCode: input.run.error?.code,
       errorMessage: input.run.error?.message,
@@ -102,6 +105,7 @@ export function buildRunDerivedContext(input: {
         assistantOutputPreview: assistantOutputPreview || undefined,
         toolCallCount: toolCalls.size,
         indexedToolCallCount: toolCallRefs.length,
+        readFilePaths,
       }),
     },
     toolCallRefs,
@@ -146,12 +150,14 @@ function buildRunSummaryText(input: {
   assistantOutputPreview?: string;
   toolCallCount: number;
   indexedToolCallCount: number;
+  readFilePaths: string[];
 }): string {
   const fragments = [
     `Run ${input.run.id} ${input.run.status}`,
     input.completionReason ? `reason: ${input.completionReason}` : undefined,
     `tool calls: ${input.toolCallCount}`,
     `indexed tool refs: ${input.indexedToolCallCount}`,
+    input.readFilePaths.length > 0 ? `read files: ${input.readFilePaths.join(", ")}` : undefined,
     input.assistantOutputPreview ? `assistant output: ${input.assistantOutputPreview}` : undefined,
   ].filter((value): value is string => Boolean(value));
   return fragments.join("; ");
@@ -244,4 +250,42 @@ function readValue(value: unknown, key: string): unknown {
 function readObject(value: unknown, key: string): Record<string, unknown> | undefined {
   const nested = readValue(value, key);
   return nested && typeof nested === "object" ? (nested as Record<string, unknown>) : undefined;
+}
+
+function collectReadFilePaths(
+  toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
+  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+): string[] {
+  const paths = new Set<string>();
+
+  for (const callEvent of toolCalls.values()) {
+    const callId = readString(callEvent.payload, "callId") ?? callEvent.id;
+    if (readString(callEvent.payload, "name") !== "read") {
+      continue;
+    }
+
+    const resultEvent = toolResults.get(callId);
+    if (resultEvent && readBoolean(resultEvent.payload, "isError")) {
+      continue;
+    }
+
+    const filePath = readReadFilePath(readValue(callEvent.payload, "input"));
+    if (!filePath) {
+      continue;
+    }
+
+    paths.add(normalizeContextFilePath(filePath));
+  }
+
+  return [...paths];
+}
+
+function readReadFilePath(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const pathValue = record.filePath ?? record.path ?? record.file ?? record.pathname;
+  return typeof pathValue === "string" && pathValue.trim().length > 0 ? pathValue : undefined;
 }

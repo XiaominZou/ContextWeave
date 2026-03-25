@@ -12,6 +12,7 @@ import type {
   RenderContextInput,
   ResumeRunInput,
 } from "@ctx/adapter-kit";
+import { renderSnapshotToPromptText } from "./context-render";
 
 export interface OpenCodeHostAdapterOptions {
   binaryPath?: string;
@@ -19,6 +20,7 @@ export interface OpenCodeHostAdapterOptions {
   cwd?: string;
   env?: Record<string, string>;
   startupTimeoutMs?: number;
+  agent?: string;
 }
 
 interface WrappedRawEvent {
@@ -36,6 +38,23 @@ interface OpenCodePromptResponse {
     finish?: string;
   };
   parts?: unknown[];
+}
+
+interface OpenCodeStoredMessage {
+  info?: Record<string, unknown>;
+  parts?: unknown[];
+}
+
+interface OpenCodeSessionStatus {
+  type?: string;
+  message?: string;
+  attempt?: number;
+  next?: number;
+}
+
+interface OpenCodePermissionRequest {
+  id?: string;
+  sessionID?: string;
 }
 
 class AsyncQueue<T> {
@@ -107,7 +126,7 @@ export class OpenCodeHostAdapter implements AgentAdapter {
       mode: "cli-process",
       argv: [],
       env: { ...this.options.env },
-      configFileInjection: input.policy.context === "native" ? undefined : renderSnapshotToText(input.snapshot),
+      configFileInjection: input.policy.context === "native" ? undefined : renderSnapshotToPromptText(input.snapshot),
     } satisfies CliAdapterPayload;
   }
 
@@ -148,6 +167,7 @@ export class OpenCodeHostAdapter implements AgentAdapter {
         const session = await postJson<{ id: string }>(`${baseUrl}/session?directory=${encodeURIComponent(cwd)}`, {
           title: input.run.id,
         }, controller.signal);
+        debug('created-session', { sessionId: session.id, cwd });
 
         queue.push({
           context,
@@ -158,16 +178,43 @@ export class OpenCodeHostAdapter implements AgentAdapter {
           },
         });
 
-        const promptResponse = await postJson<OpenCodePromptResponse>(
-          `${baseUrl}/session/${session.id}/message?directory=${encodeURIComponent(cwd)}`,
-          {
-            ...(payload.configFileInjection ? { system: payload.configFileInjection } : {}),
-            parts: [{ type: 'text', text: userPrompt(input.run) }],
-          },
+        const promptBody = {
+          ...(payload.configFileInjection ? { system: payload.configFileInjection } : {}),
+          parts: [{ type: 'text', text: userPrompt(input.run) }],
+          ...(input.run.model ? { model: input.run.model } : {}),
+          ...(this.options.agent ? { agent: this.options.agent } : {}),
+          noReply: false,
+        };
+
+        const promptResponse = await postMaybeJson<OpenCodePromptResponse>(
+          `${baseUrl}/session/${session.id}/message`,
+          promptBody,
           controller.signal,
         );
-
-        emitPromptResponse(queue, context, promptResponse);
+        if (promptResponse) {
+          debug('prompt-response', {
+            sessionId: session.id,
+            finish: isRecord(promptResponse.info) ? readString(promptResponse.info.finish) ?? null : null,
+            partCount: Array.isArray(promptResponse.parts) ? promptResponse.parts.length : 0,
+          });
+          emitPromptResponse(queue, context, promptResponse);
+        }
+        else {
+          debug('prompt-response-empty', { sessionId: session.id });
+          await postWithoutReadingBody(
+            `${baseUrl}/session/${session.id}/prompt_async`,
+            promptBody,
+            controller.signal,
+          );
+          const completed = await pollCompletedAssistantMessage({
+            baseUrl,
+            cwd,
+            sessionId: session.id,
+            signal: controller.signal,
+            timeoutMs: 90_000,
+          });
+          emitPromptResponse(queue, context, completed);
+        }
       } catch (error) {
         queue.push({
           context,
@@ -252,8 +299,8 @@ export class OpenCodeHostAdapter implements AgentAdapter {
           type: 'tool.call',
           payload: {
             callId: readString(event.callID) ?? readString(event.callId) ?? readString(event.id) ?? 'call_unknown',
-            name: readString(event.name) ?? readNestedString(event.part, 'name') ?? 'unknown_tool',
-            input: event.input ?? readNestedValue(event.part, 'input') ?? {},
+            name: readString(event.name) ?? readString(event.tool) ?? readNestedString(event.part, 'tool') ?? readNestedString(event.part, 'name') ?? 'unknown_tool',
+            input: event.input ?? readNestedValue(event.part, 'input') ?? readNestedValue(readNestedValue(event.part, 'state'), 'input') ?? {},
           },
         };
       case 'tool.result':
@@ -265,6 +312,26 @@ export class OpenCodeHostAdapter implements AgentAdapter {
             callId: readString(event.callID) ?? readString(event.callId) ?? 'call_unknown',
             output: event.output ?? readNestedValue(event.part, 'output') ?? null,
             isError: readBoolean(event.isError) ?? false,
+          },
+        };
+      case 'usage':
+      case 'run.usage':
+        return {
+          ...base,
+          type: 'run.usage',
+          payload: {
+            inputTokens:
+              readNumber(event.inputTokens) ??
+              readNumber(event.input_tokens) ??
+              readNestedNumber(event.usage, 'inputTokens') ??
+              readNestedNumber(event.usage, 'input_tokens'),
+            outputTokens:
+              readNumber(event.outputTokens) ??
+              readNumber(event.output_tokens) ??
+              readNestedNumber(event.usage, 'outputTokens') ??
+              readNestedNumber(event.usage, 'output_tokens'),
+            cacheReadInputTokens: readUsageCacheReadTokens(event),
+            cacheWriteInputTokens: readUsageCacheWriteTokens(event),
           },
         };
       case 'run.completed':
@@ -304,6 +371,17 @@ function emitPromptResponse(
   context: WrappedRawEvent['context'],
   response: OpenCodePromptResponse,
 ): void {
+  const usage = isRecord(response.info) ? readNestedValue(response.info, 'usage') : undefined;
+  if (isRecord(usage)) {
+    queue.push({
+      context,
+      event: {
+        type: 'run.usage',
+        usage,
+      },
+    });
+  }
+
   for (const part of response.parts ?? []) {
     if (!isRecord(part)) {
       continue;
@@ -351,6 +429,140 @@ function emitPromptResponse(
   });
 }
 
+async function pollCompletedAssistantMessage(input: {
+  baseUrl: string;
+  cwd: string;
+  sessionId: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+}): Promise<OpenCodePromptResponse> {
+  const deadline = Date.now() + input.timeoutMs;
+  while (Date.now() < deadline) {
+    if (input.signal.aborted) {
+      throw new Error('OpenCode host polling aborted');
+    }
+
+    await autoReplyPendingPermissions(input);
+
+    const messages = await getJson<Array<OpenCodeStoredMessage>>(
+      `${input.baseUrl}/session/${input.sessionId}/message?directory=${encodeURIComponent(input.cwd)}`,
+      input.signal,
+    );
+    const statuses = await getJson<Record<string, OpenCodeSessionStatus>>(
+      `${input.baseUrl}/session/status?directory=${encodeURIComponent(input.cwd)}`,
+      input.signal,
+    ).catch(() => undefined);
+    const status = statuses?.[input.sessionId];
+    debug('host-poll', buildPollDebugSnapshot({
+      sessionId: input.sessionId,
+      messages,
+      status,
+      permissionsReplied: undefined,
+    }));
+    const completed = [...messages]
+      .reverse()
+      .find((message) => isCompletedAssistantMessage(message, input.sessionId));
+    if (completed) {
+      return {
+        info: completed.info,
+        parts: completed.parts,
+      };
+    }
+
+    await delay(1000);
+  }
+
+  const messages = await getJson<Array<OpenCodeStoredMessage>>(
+    `${input.baseUrl}/session/${input.sessionId}/message?directory=${encodeURIComponent(input.cwd)}`,
+    input.signal,
+  ).catch(() => []);
+  const statuses = await getJson<Record<string, OpenCodeSessionStatus>>(
+    `${input.baseUrl}/session/status?directory=${encodeURIComponent(input.cwd)}`,
+    input.signal,
+  ).catch(() => undefined);
+  const status = statuses?.[input.sessionId];
+  const permissions = await getJson<Array<OpenCodePermissionRequest>>(
+    `${input.baseUrl}/permission?directory=${encodeURIComponent(input.cwd)}`,
+    input.signal,
+  ).catch(() => []);
+
+  throw new Error(
+    `Timed out waiting for completed assistant message for session ${input.sessionId}. ${JSON.stringify(buildPollDebugSnapshot({
+      sessionId: input.sessionId,
+      messages,
+      status,
+      permissionsReplied: permissions.filter((item) => item?.sessionID === input.sessionId).length,
+    }))}`,
+  );
+}
+
+function isCompletedAssistantMessage(message: OpenCodeStoredMessage, sessionId: string): boolean {
+  const info = isRecord(message.info) ? message.info : undefined;
+  if (!info) {
+    return false;
+  }
+  if (readString(info.role) !== 'assistant') {
+    return false;
+  }
+  if (readString(info.sessionID) !== sessionId) {
+    return false;
+  }
+  const time = isRecord(info.time) ? info.time : undefined;
+  return typeof readNumber(time?.completed) === 'number';
+}
+
+function buildPollDebugSnapshot(input: {
+  sessionId: string;
+  messages: Array<OpenCodeStoredMessage>;
+  status?: OpenCodeSessionStatus;
+  permissionsReplied: number | undefined;
+}): Record<string, unknown> {
+  const latest = [...input.messages]
+    .reverse()
+    .find((message) => {
+      const info = isRecord(message.info) ? message.info : undefined;
+      return readString(info?.sessionID) === input.sessionId;
+    });
+  const latestInfo = isRecord(latest?.info) ? latest.info : undefined;
+  return {
+    sessionId: input.sessionId,
+    sessionStatus: input.status?.type ?? null,
+    sessionStatusMessage: input.status?.message ?? null,
+    messageCount: input.messages.length,
+    latestRole: readString(latestInfo?.role),
+    latestFinish: readString(latestInfo?.finish),
+    latestCompletedAt: isRecord(latestInfo?.time) ? readNumber(latestInfo.time.completed) : undefined,
+    latestPartTypes: Array.isArray(latest?.parts)
+      ? latest.parts
+          .filter((part) => isRecord(part))
+          .map((part) => readString((part as Record<string, unknown>).type))
+          .filter(Boolean)
+      : [],
+    pendingPermissions: input.permissionsReplied,
+  };
+}
+
+async function autoReplyPendingPermissions(input: {
+  baseUrl: string;
+  cwd: string;
+  sessionId: string;
+  signal: AbortSignal;
+}): Promise<void> {
+  const pending = await getJson<Array<OpenCodePermissionRequest>>(
+    `${input.baseUrl}/permission?directory=${encodeURIComponent(input.cwd)}`,
+    input.signal,
+  ).catch(() => []);
+
+  const relevant = pending.filter((item) => item && item.sessionID === input.sessionId && typeof item.id === 'string');
+  for (const request of relevant) {
+    await postJson<boolean>(
+      `${input.baseUrl}/permission/${request.id}/reply?directory=${encodeURIComponent(input.cwd)}`,
+      { reply: 'once' },
+      input.signal,
+    );
+  }
+}
+
 async function waitForServerUrl(child: ChildProcessWithoutNullStreams, port: number, timeoutMs: number): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     let output = '';
@@ -386,7 +598,7 @@ async function waitForServerUrl(child: ChildProcessWithoutNullStreams, port: num
 async function postJson<T>(url: string, body: unknown, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withDirectoryHeaders(url, { 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
     signal,
   });
@@ -394,6 +606,87 @@ async function postJson<T>(url: string, body: unknown, signal: AbortSignal): Pro
     throw new Error(`OpenCode host HTTP ${response.status}: ${await response.text()}`);
   }
   return (await response.json()) as T;
+}
+
+async function postMaybeJson<T>(url: string, body: unknown, signal: AbortSignal): Promise<T | undefined> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: withDirectoryHeaders(url, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`OpenCode host HTTP ${response.status}: ${await response.text()}`);
+  }
+  const text = await response.text();
+  debug('http-post', {
+    url,
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    contentLength: response.headers.get('content-length'),
+    bodyLength: text.length,
+  });
+  if (!text.trim()) {
+    return undefined;
+  }
+  return JSON.parse(text) as T;
+}
+
+async function postWithoutReadingBody(url: string, body: unknown, signal: AbortSignal): Promise<void> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: withDirectoryHeaders(url, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`OpenCode host HTTP ${response.status}: ${await response.text()}`);
+  }
+  debug('http-post-empty', {
+    url,
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    contentLength: response.headers.get('content-length'),
+  });
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Ignore body cancellation errors; we only need the request to be accepted.
+  }
+}
+
+async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: withDirectoryHeaders(url),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`OpenCode host HTTP ${response.status}: ${await response.text()}`);
+  }
+  return await response.json() as T;
+}
+
+function withDirectoryHeaders(url: string, headers: Record<string, string> = {}): Record<string, string> {
+  try {
+    const parsed = new URL(url);
+    const directory = parsed.searchParams.get('directory');
+    if (!directory) {
+      return headers;
+    }
+    return {
+      ...headers,
+      'x-opencode-directory': directory,
+    };
+  } catch {
+    return headers;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -425,13 +718,6 @@ function userPrompt(run: AdapterRunInput['run']): string {
     return String(run.metadata['prompt']);
   }
   return run.model ? `Continue task ${run.id}` : `Run task ${run.id}`;
-}
-
-function renderSnapshotToText(snapshot: RenderContextInput['snapshot']): string {
-  if (!snapshot) {
-    return '';
-  }
-  return snapshot.blocks.map((block) => block.content).join('\n');
 }
 
 function resolveCommand(binaryPath?: string): string {
@@ -486,6 +772,10 @@ function readBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 
+function readNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 function readNestedString(value: unknown, key: string): string | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -493,11 +783,40 @@ function readNestedString(value: unknown, key: string): string | undefined {
   return readString(value[key]);
 }
 
+function readNestedNumber(value: unknown, key: string): number | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  return readNumber(value[key]);
+}
+
 function readNestedValue(value: unknown, key: string): unknown {
   if (!isRecord(value)) {
     return undefined;
   }
   return value[key];
+}
+
+function readUsageCacheReadTokens(event: Record<string, unknown>): number | undefined {
+  return (
+    readNumber(event.cacheReadInputTokens) ??
+    readNumber(event.cache_read_input_tokens) ??
+    readNestedNumber(event.usage, 'cacheReadInputTokens') ??
+    readNestedNumber(event.usage, 'cache_read_input_tokens') ??
+    readNestedNumber(readNestedValue(event.usage, 'cache'), 'read') ??
+    readNestedNumber(readNestedValue(event.usage, 'cache'), 'read_tokens')
+  );
+}
+
+function readUsageCacheWriteTokens(event: Record<string, unknown>): number | undefined {
+  return (
+    readNumber(event.cacheWriteInputTokens) ??
+    readNumber(event.cache_write_input_tokens) ??
+    readNestedNumber(event.usage, 'cacheWriteInputTokens') ??
+    readNestedNumber(event.usage, 'cache_write_input_tokens') ??
+    readNestedNumber(readNestedValue(event.usage, 'cache'), 'write') ??
+    readNestedNumber(readNestedValue(event.usage, 'cache'), 'write_tokens')
+  );
 }
 
 function debug(label: string, value: unknown): void {

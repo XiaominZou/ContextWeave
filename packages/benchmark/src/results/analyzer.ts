@@ -1,3 +1,4 @@
+import { normalizeContextFilePath } from "@ctx/core";
 import type {
   BenchmarkAnalysis,
   BenchmarkMode,
@@ -19,10 +20,18 @@ function summarizeMode(mode: BenchmarkMode, runs: BenchmarkRunResult[]): Benchma
     mode,
     repeatCount: runs.length,
     totalInputTokens: spread(runs.map((run) => sum(run.llmCalls.map((call) => call.inputTokens)))),
+    totalCacheReadInputTokens: spread(runs.map((run) => sum(run.llmCalls.map((call) => call.cacheReadInputTokens ?? 0)))),
+    totalInputTokensWithCache: spread(runs.map((run) => sum(run.llmCalls.map((call) => call.inputTokens + (call.cacheReadInputTokens ?? 0))))),
     totalOutputTokens: spread(runs.map((run) => sum(run.llmCalls.map((call) => call.outputTokens)))),
     averageInputTokensR6ToR10: spread(runs.map((run) => average(run.llmCalls.filter((call) => call.round >= 6 && call.round <= 10).map((call) => call.inputTokens)))),
+    averageInputTokensWithCacheR6ToR10: spread(runs.map((run) => average(run.llmCalls.filter((call) => call.round >= 6 && call.round <= 10).map((call) => call.inputTokens + (call.cacheReadInputTokens ?? 0))))),
     completionScore: spread(runs.map((run) => run.completion.total)),
     totalLlmCalls: spread(runs.map((run) => run.llmCalls.length)),
+    totalToolCalls: spread(runs.map((run) => run.toolCalls.length)),
+    readToolCalls: spread(runs.map((run) => countToolCalls(run, "read"))),
+    distinctReadTargets: spread(runs.map((run) => countDistinctReadTargets(run))),
+    repeatedReadCallRatio: spread(runs.map((run) => calculateRepeatedReadCallRatio(run))),
+    bashToolCalls: spread(runs.map((run) => countToolCalls(run, "bash"))),
     wastedToolCallRatio: spread(runs.map((run) => ratio(run.wastedCalls.length, run.toolCalls.length))),
     memoryExtractionTokens: spread(runs.map((run) => sum(run.llmCalls.map((call) => call.contextBreakdown?.memoryExtractionTokens ?? 0)))),
   };
@@ -116,4 +125,50 @@ function ratio(numerator: number, denominator: number): number {
 
 function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
+}
+
+function countToolCalls(run: BenchmarkRunResult, toolName: string): number {
+  return run.toolCalls.filter((call) => call.toolName === toolName).length;
+}
+
+function countDistinctReadTargets(run: BenchmarkRunResult): number {
+  const targets = new Set(
+    run.toolCalls
+      .filter((call) => call.toolName === "read")
+      .map((call) => readTargetFromSignature(call.inputSignature))
+      .filter((value): value is string => value.length > 0),
+  );
+  return targets.size;
+}
+
+function calculateRepeatedReadCallRatio(run: BenchmarkRunResult): number {
+  const readTargets = run.toolCalls
+    .filter((call) => call.toolName === "read")
+    .map((call) => readTargetFromSignature(call.inputSignature))
+    .filter((value): value is string => value.length > 0);
+
+  if (readTargets.length === 0) {
+    return 0;
+  }
+
+  return (readTargets.length - new Set(readTargets).size) / readTargets.length;
+}
+
+function readTargetFromSignature(inputSignature: string): string {
+  try {
+    const parsed = JSON.parse(inputSignature) as Record<string, unknown>;
+    const rawPath = firstString(parsed.filePath, parsed.path, parsed.file, parsed.pathname);
+    return rawPath ? normalizeContextFilePath(rawPath) : "";
+  } catch {
+    return "";
+  }
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }

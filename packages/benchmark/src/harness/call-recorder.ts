@@ -25,7 +25,12 @@ export class CallRecorder {
   record(input: RecordEventInput): void {
     const { event } = input;
     if (event.type === "run.usage") {
-      const usage = event.payload as { inputTokens?: number; outputTokens?: number };
+      const usage = event.payload as {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheWriteInputTokens?: number;
+      };
       const contextBreakdown = input.contextBreakdowns?.[this.llmCallCounter];
       this.llmCallCounter += 1;
       this.llmCalls.push({
@@ -36,6 +41,8 @@ export class CallRecorder {
         purpose: input.purpose ?? "other",
         inputTokens: usage.inputTokens ?? 0,
         outputTokens: usage.outputTokens ?? 0,
+        cacheReadInputTokens: usage.cacheReadInputTokens ?? 0,
+        cacheWriteInputTokens: usage.cacheWriteInputTokens ?? 0,
         totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
         timestamp: event.timestamp,
         contextBreakdown,
@@ -52,6 +59,7 @@ export class CallRecorder {
         round: input.round,
         toolName: payload.name,
         inputSignature: stableStringify(payload.input),
+        timestamp: event.timestamp,
         isError: false,
         availableMemoryIds: input.toolMemoryMap?.[payload.callId] ?? [],
         yieldedNewInformation: input.toolNewInformationMap?.[payload.callId],

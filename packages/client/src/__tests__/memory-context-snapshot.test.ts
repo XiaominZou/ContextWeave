@@ -338,6 +338,7 @@ describe("context snapshot builder", () => {
       kind: "task",
       title: "Refactor auth flow summary",
     });
+    expect(taskSummaryBlock?.content).not.toContain("latest run:");
     expect(dependencySummaryBlock).toMatchObject({
       kind: "task",
       title: "Prepare auth constraints dependency summary",
@@ -353,6 +354,50 @@ describe("context snapshot builder", () => {
       sourceRef: "run_prev",
       metadata: expect.objectContaining({ sourceType: "run-summary" }),
     });
+  });
+
+  test("suppresses prior run summaries when context hint disables them", async () => {
+    const memoryApi = makeMemoryApi();
+    const task: Task = makeTask();
+    const priorRun: Run = {
+      id: "run_prev",
+      workspaceId: "ws_1",
+      sessionId: "sess_1",
+      taskId: "task_1",
+      adapter: "mock",
+      status: "completed",
+      attempt: 1,
+      endedAt: new Date().toISOString(),
+      metadata: {
+        [RUN_SUMMARY_METADATA_KEY]: {
+          version: "1",
+          generatedAt: new Date().toISOString(),
+          status: "completed",
+          messageCount: 1,
+          toolCallCount: 1,
+          indexedToolCallCount: 1,
+          summaryText: "Prior run fixed the middleware shape but left one validation gap.",
+        },
+      },
+    };
+
+    const snapshot = await buildContextSnapshot({
+      run: makeRun(),
+      task,
+      policy: {
+        context: "inject",
+        memory: "off",
+        tasks: "observe-native",
+        artifacts: "observe",
+        contextHints: {
+          suppressRunSummaries: true,
+        },
+      },
+      memoryApi,
+      store: makeStore({ tasks: [task], runs: [priorRun] }),
+    });
+
+    expect(snapshot.blocks.some((block) => block.metadata?.["sourceType"] === "run-summary")).toBe(false);
   });
 
   test("prefers session preload memory blocks and deduplicates matching task search hits", async () => {
@@ -399,7 +444,8 @@ describe("context snapshot builder", () => {
     });
 
     expect(snapshot.blocks).toHaveLength(2);
-    expect(snapshot.blocks[0]).toMatchObject({
+    const preloadBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "session-preload");
+    expect(preloadBlock).toMatchObject({
       kind: "memory",
       title: "Coding style",
       sourceRef: "mem_profile",
@@ -409,7 +455,8 @@ describe("context snapshot builder", () => {
         retentionAction: "summary-only",
       }),
     });
-    expect(snapshot.blocks[1]).toMatchObject({
+    const taskBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "task");
+    expect(taskBlock).toMatchObject({
       kind: "task",
       sourceRef: "task_1",
     });
@@ -587,6 +634,117 @@ describe("context snapshot builder", () => {
         expect.objectContaining({ sourceRef: "sess_1" }),
       ]),
     );
+  });
+
+  test("session summaries avoid embedding nested task summaries", async () => {
+    const memoryApi = makeMemoryApi();
+    const now = new Date().toISOString();
+    const task = makeTask({
+      status: "completed",
+      metadata: {
+        [TASK_SUMMARY_METADATA_KEY]: {
+          version: "1",
+          generatedAt: now,
+          taskStatus: "completed",
+          runCount: 2,
+          completedRunCount: 2,
+          failedRunCount: 0,
+          cancelledRunCount: 0,
+          indexedToolCallCount: 1,
+          latestRunIds: ["run_prev"],
+          summaryText: "Task summary says auth work already has one successful attempt.",
+        },
+      },
+    });
+    const session = makeSession({
+      metadata: {
+        [SESSION_SUMMARY_METADATA_KEY]: {
+          version: "1",
+          generatedAt: now,
+          sessionStatus: "active",
+          taskCount: 1,
+          completedTaskCount: 1,
+          failedTaskCount: 0,
+          cancelledTaskCount: 0,
+          runCount: 1,
+          completedRunCount: 1,
+          failedRunCount: 0,
+          cancelledRunCount: 0,
+          latestTaskIds: [task.id],
+          latestRunIds: ["run_prev"],
+          summaryText: "Session summary placeholder.",
+        },
+        [SESSION_GRAPH_INDEX_METADATA_KEY]: {
+          version: "1",
+          generatedAt: now,
+          sessionId: "sess_1",
+          taskIds: [task.id],
+          nodes: [],
+          edges: [],
+        },
+      },
+    });
+
+    const snapshot = await buildContextSnapshot({
+      run: makeRun(),
+      task,
+      policy: {
+        context: "inject",
+        memory: "off",
+        tasks: "observe-native",
+        artifacts: "observe",
+      },
+      memoryApi,
+      store: makeStore({ sessions: [session], tasks: [task] }),
+    });
+
+    const sessionSummaryBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "session-summary");
+    expect(sessionSummaryBlock?.content).not.toContain("latest task:");
+  });
+
+  test("context token budget can drop lower-priority hard recall blocks", async () => {
+    const memoryApi = makeMemoryApi();
+    const preloadHits: MemorySearchHit[] = Array.from({ length: 20 }, (_, index) => ({
+      record: {
+        id: `mem_profile_${index}`,
+        workspaceId: "ws_1",
+        userId: "user_1",
+        ownerRef: { type: "user" as const, id: "user_1" },
+        scope: "user" as const,
+        layer: "long_term" as const,
+        channel: "profile" as const,
+        kind: "preference" as const,
+        status: "active" as const,
+        title: `Coding style ${index}`,
+        content: `Prefer compact helper style ${index}. ${"detail ".repeat(120)}`,
+        summary: `Preferred style ${index}. ${"signal ".repeat(80)}`,
+        importance: 0.95,
+        confidence: 0.9,
+        version: 1,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      finalScore: 0.97 - index * 0.01,
+    }));
+    const task = makeTask();
+
+    const snapshot = await buildContextSnapshot({
+      run: makeRun(),
+      task,
+      policy: {
+        context: "inject",
+        memory: "off",
+        tasks: "observe-native",
+        artifacts: "observe",
+      },
+      memoryApi,
+      store: makeStore({ tasks: [task] }),
+      preloadedMemoryHits: preloadHits,
+    });
+
+    expect(snapshot.blocks.some((block) => block.metadata?.["sourceType"] === "task")).toBe(true);
+    expect(snapshot.blocks.length).toBeLessThan(preloadHits.length + 1);
+    expect(snapshot.tokenEstimate).toBeLessThanOrEqual(900);
   });
 });
 

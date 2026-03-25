@@ -76,7 +76,16 @@ const server = http.createServer(async (req, res) => {
     parts.push({ id: 'text_1', type: 'text', text: responseText });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      info: { id: `msg_${sessionId}`, finish: 'stop' },
+      info: {
+        id: `msg_${sessionId}`,
+        finish: 'stop',
+        usage: {
+          input_tokens: 432,
+          output_tokens: 54,
+          cache_read_input_tokens: 33,
+          cache_write_input_tokens: 0,
+        },
+      },
       parts,
     }));
     return;

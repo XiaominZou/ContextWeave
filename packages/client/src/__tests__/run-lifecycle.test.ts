@@ -563,6 +563,8 @@ describe("Run lifecycle", () => {
             { type: "tool_result", callId: "call_error", output: { message: "boom" }, isError: true },
             { type: "tool_call", callId: "call_artifact", name: "write_file", input: { path: "report.md" } },
             { type: "tool_result", callId: "call_artifact", output: { artifactId: "art_1", artifacts: [{ id: "art_2" }] } },
+            { type: "tool_call", callId: "call_read", name: "read", input: { filePath: "C:\\tmp\\ctx-benchmark-fixture\\minikanban\\README.md" } },
+            { type: "tool_result", callId: "call_read", output: { ok: true } },
             { type: "tool_call", callId: "call_ignored", name: "pwd", input: {} },
             { type: "tool_result", callId: "call_ignored", output: { ok: true } },
             { type: "text_delta", text: "Final answer" },
@@ -602,6 +604,7 @@ describe("Run lifecycle", () => {
       completionReason?: string;
       toolCallCount: number;
       indexedToolCallCount: number;
+      readFilePaths: string[];
       assistantOutputPreview?: string;
       summaryText: string;
     };
@@ -618,11 +621,13 @@ describe("Run lifecycle", () => {
     expect(summary).toMatchObject({
       status: "completed",
       completionReason: "end_turn",
-      toolCallCount: 3,
+      toolCallCount: 4,
       indexedToolCallCount: 2,
+      readFilePaths: ["/README.md"],
       assistantOutputPreview: "Final answer",
     });
     expect(summary.summaryText).toContain(handle.runId);
+    expect(summary.summaryText).toContain("read files: /README.md");
 
     expect(toolRefs).toHaveLength(2);
     expect(toolRefs).toEqual(
@@ -737,7 +742,7 @@ describe("Run lifecycle", () => {
       latestRunIds: ["run_fail", "run_done"],
     });
     expect(summary.summaryText).toContain("runs: 2");
-    expect(summary.summaryText).toContain("latest run: Run run_fail failed with boom.");
+    expect(summary.summaryText).toContain("runs with summaries: 2");
     expect(graphIndex.latestRunIds).toEqual(["run_fail", "run_done"]);
     expect(graphIndex.dependencyTaskIds).toEqual([]);
   });
@@ -829,7 +834,7 @@ describe("Run lifecycle", () => {
       latestRunIds: ["run_b", "run_a"],
     });
     expect(summary.summaryText).toContain("tasks: 2");
-    expect(summary.summaryText).toContain("latest task: Task A completed the release checklist.");
+    expect(summary.summaryText).toContain("tracked tasks: 2");
     expect(graphIndex.taskIds).toEqual([taskA.id, taskB.id]);
     expect(Array.isArray(graphIndex.edges)).toBe(true);
 

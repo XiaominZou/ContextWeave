@@ -6,11 +6,16 @@ export type TasksMode = "observe-native" | "mirror-native" | "platform-tools";
 
 export type ArtifactsMode = "observe" | "capture-store";
 
+export interface CapabilityContextHints {
+  suppressRunSummaries?: boolean;
+}
+
 export interface CapabilityPolicy {
   context: ContextMode;
   memory: MemoryMode;
   tasks: TasksMode;
   artifacts: ArtifactsMode;
+  contextHints?: CapabilityContextHints;
 }
 
 export const defaultCapabilityPolicy: CapabilityPolicy = {

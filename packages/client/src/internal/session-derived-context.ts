@@ -1,7 +1,5 @@
 import type { Run, Session, Task } from "@ctx/core";
 
-import { readTaskSummary } from "./task-derived-context";
-
 export const SESSION_SUMMARY_METADATA_KEY = "platformSessionSummary";
 
 export interface SessionSummaryV1 {
@@ -24,7 +22,6 @@ export interface SessionSummaryV1 {
 export function buildSessionDerivedContext(input: { session: Session; tasks: Task[]; runs: Run[] }): { sessionSummary: SessionSummaryV1 } {
   const sortedTasks = [...input.tasks].sort((left, right) => sortTaskByRecency(right).localeCompare(sortTaskByRecency(left)));
   const sortedRuns = [...input.runs].sort((left, right) => sortRunByRecency(right).localeCompare(sortRunByRecency(left)));
-  const latestTaskSummary = sortedTasks.map((task) => readTaskSummary(task)).find((summary) => Boolean(summary));
 
   const sessionSummary: SessionSummaryV1 = {
     version: "1",
@@ -44,7 +41,6 @@ export function buildSessionDerivedContext(input: { session: Session; tasks: Tas
       session: input.session,
       tasks: sortedTasks,
       runs: sortedRuns,
-      latestTaskSummary: latestTaskSummary?.summaryText,
     }),
   };
 
@@ -60,7 +56,6 @@ function buildSessionSummaryText(input: {
   session: Session;
   tasks: Task[];
   runs: Run[];
-  latestTaskSummary?: string;
 }): string {
   const fragments = [
     `Session ${input.session.id} ${input.session.status}`,
@@ -70,7 +65,7 @@ function buildSessionSummaryText(input: {
     input.tasks.some((task) => task.status === "failed") ? `failed tasks: ${input.tasks.filter((task) => task.status === "failed").length}` : undefined,
     input.tasks.some((task) => task.status === "cancelled") ? `cancelled tasks: ${input.tasks.filter((task) => task.status === "cancelled").length}` : undefined,
     input.runs.some((run) => run.status === "failed") ? `failed runs: ${input.runs.filter((run) => run.status === "failed").length}` : undefined,
-    input.latestTaskSummary ? `latest task: ${input.latestTaskSummary}` : undefined,
+    input.tasks.length > 0 ? `tracked tasks: ${input.tasks.length}` : undefined,
   ].filter((value): value is string => Boolean(value));
 
   return fragments.join("; ");

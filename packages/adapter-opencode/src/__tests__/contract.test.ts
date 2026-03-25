@@ -62,10 +62,30 @@ runAdapterContractTests(new OpenCodeAdapter({ binaryPath: "opencode" }), {
       expectedPayloadShape: { role: "assistant", text: "Hello" },
     },
     {
-      description: "tool use call",
-      rawEvent: { type: "tool_use", id: "call_abc", name: "bash", input: { command: "ls" } },
+      description: "tool use call with nested state input",
+      rawEvent: {
+        type: "tool_use",
+        timestamp: 1774427685541,
+        sessionID: "ses_real_123",
+        part: {
+          id: "prt_tool_1",
+          sessionID: "ses_real_123",
+          messageID: "msg_real_123",
+          type: "tool",
+          callID: "call_abc",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "E:\\vibecoding\\sdk\\V1\\package.json" },
+          },
+        },
+      },
       expectedType: "tool.call",
-      expectedPayloadShape: { callId: "call_abc", name: "bash" },
+      expectedPayloadShape: {
+        callId: "call_abc",
+        name: "read",
+        input: { filePath: "E:\\vibecoding\\sdk\\V1\\package.json" },
+      },
     },
     {
       description: "tool result",
@@ -74,18 +94,18 @@ runAdapterContractTests(new OpenCodeAdapter({ binaryPath: "opencode" }), {
       expectedPayloadShape: { callId: "call_abc", isError: false },
     },
     {
-      description: "real step_finish event becomes run.completed",
+      description: "usage event",
+      rawEvent: { type: "usage", input_tokens: 1200, output_tokens: 250 },
+      expectedType: "run.usage",
+      expectedPayloadShape: { inputTokens: 1200, outputTokens: 250 },
+    },
+    {
+      description: "real run_completed event becomes run.completed",
       rawEvent: {
-        type: "step_finish",
+        type: "run_completed",
         timestamp: 1773928201332,
         sessionID: "ses_real_123",
-        part: {
-          id: "prt_step_finish",
-          sessionID: "ses_real_123",
-          messageID: "msg_real_123",
-          type: "step-finish",
-          reason: "stop",
-        },
+        reason: "stop",
       },
       expectedType: "run.completed",
       expectedPayloadShape: { reason: "stop" },

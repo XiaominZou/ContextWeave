@@ -71,7 +71,6 @@ function buildTaskSummaryText(input: {
   runSummaries: RunSummaryV1[];
   indexedToolCallCount: number;
 }): string {
-  const latestSummary = input.runSummaries[0]?.summaryText;
   const fragments = [
     `Task ${input.task.id} ${input.task.status}`,
     `runs: ${input.runs.length}`,
@@ -79,7 +78,7 @@ function buildTaskSummaryText(input: {
     input.runs.some((run) => run.status === "failed") ? `failed: ${input.runs.filter((run) => run.status === "failed").length}` : undefined,
     input.runs.some((run) => run.status === "cancelled") ? `cancelled: ${input.runs.filter((run) => run.status === "cancelled").length}` : undefined,
     input.indexedToolCallCount > 0 ? `indexed tool refs: ${input.indexedToolCallCount}` : undefined,
-    latestSummary ? `latest run: ${latestSummary}` : undefined,
+    input.runSummaries.length > 0 ? `runs with summaries: ${input.runSummaries.length}` : undefined,
   ].filter((value): value is string => Boolean(value));
   return fragments.join("; ");
 }
