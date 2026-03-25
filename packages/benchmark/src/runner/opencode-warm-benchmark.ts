@@ -324,6 +324,13 @@ function seedWarmPlatformState(input: {
 }): void {
   const now = new Date().toISOString();
   const readFilePaths = ["/README.md", "/SPEC.md", "/pyproject.toml"];
+  const editedFilePaths = ["/app/store.py", "/app/routes/boards.py", "/app/routes/tasks.py"];
+  const commandPreviews = ["python -m pytest tests/ -q"];
+  const failureHints = [
+    "pytest: duplicate tags should return 422",
+    "pytest: board stats should count todo/doing/done correctly",
+    "pytest: deleting a board should cascade-delete its tasks",
+  ];
   const seedRunId = `run_seed_${input.task.id}_${input.iteration}`;
   const assistantOutputPreview = "Boards CRUD and basic task CRUD are in place. Remaining work: tag validation, filtered task listing, board stats, done-title immutability, and cascade delete.";
 
@@ -347,8 +354,11 @@ function seedWarmPlatformState(input: {
         toolCallCount: 3,
         indexedToolCallCount: 0,
         readFilePaths,
+        editedFilePaths,
+        commandPreviews,
+        failureHints,
         assistantOutputPreview,
-        summaryText: `Run ${seedRunId} completed; tool calls: 3; indexed tool refs: 0; read files: ${readFilePaths.join(", ")}; assistant output: ${assistantOutputPreview}`,
+        summaryText: `Run ${seedRunId} completed; tool calls: 3; indexed tool refs: 0; read files: ${readFilePaths.join(", ")}; edited files: ${editedFilePaths.join(", ")}; commands: ${commandPreviews.join(" | ")}; known failures: ${failureHints.join(" | ")}; assistant output: ${assistantOutputPreview}`,
       },
     },
   });
@@ -369,7 +379,12 @@ function seedWarmPlatformState(input: {
         cancelledRunCount: 0,
         indexedToolCallCount: 0,
         latestRunIds: [seedRunId],
-        summaryText: `Task ${input.task.id} running; runs: 1; completed: 1; runs with summaries: 1`,
+        recentReadFilePaths: readFilePaths,
+        recentEditedFilePaths: editedFilePaths,
+        recentCommandPreviews: commandPreviews,
+        recentFailureHints: failureHints,
+        latestAssistantOutputPreview: assistantOutputPreview,
+        summaryText: `Task ${input.task.id} running; runs: 1; completed: 1; runs with summaries: 1; recent reads: ${readFilePaths.join(", ")}; recent edits: ${editedFilePaths.join(", ")}; recent commands: ${commandPreviews.join(" | ")}; known failures: ${failureHints.join(" | ")}; latest progress: ${assistantOutputPreview}`,
       },
     },
   });

@@ -293,10 +293,16 @@ async function collectMemoryBlocks(input: ContextCollectorInput): Promise<Contex
 
 function buildTaskContextBlock(task: Task): ContextBlock {
   const nativeMirror = readNativeTaskMirror(task);
+  const taskSummary = readTaskSummary(task);
   const lines = [
     `[TASK] ${task.title}`,
     task.objective ? `Objective: ${task.objective}` : undefined,
     task.instructions ? `Instructions: ${task.instructions}` : undefined,
+    taskSummary?.recentEditedFilePaths?.length ? `Recent edits: ${taskSummary.recentEditedFilePaths.join(", ")}` : undefined,
+    taskSummary?.recentReadFilePaths?.length ? `Recent working set: ${taskSummary.recentReadFilePaths.join(", ")}` : undefined,
+    taskSummary?.recentCommandPreviews?.length ? `Recent commands: ${taskSummary.recentCommandPreviews.join(" | ")}` : undefined,
+    taskSummary?.recentFailureHints?.length ? `Known failures: ${taskSummary.recentFailureHints.join(" | ")}` : undefined,
+    taskSummary?.latestAssistantOutputPreview ? `Latest progress: ${taskSummary.latestAssistantOutputPreview}` : undefined,
     nativeMirror ? `Native mirror: ${nativeMirror.summaryText}` : undefined,
     nativeMirror?.currentFocus ? `Current focus: ${nativeMirror.currentFocus}` : undefined,
   ].filter((value): value is string => Boolean(value));

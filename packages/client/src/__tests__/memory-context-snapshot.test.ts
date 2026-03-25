@@ -280,6 +280,11 @@ describe("context snapshot builder", () => {
           cancelledRunCount: 0,
           indexedToolCallCount: 1,
           latestRunIds: ["run_prev"],
+          recentReadFilePaths: ["/README.md"],
+          recentEditedFilePaths: ["/app/store.py"],
+          recentCommandPreviews: ["npm test"],
+          recentFailureHints: ["bash: boom"],
+          latestAssistantOutputPreview: "Focus on validation gap in tasks route.",
           summaryText: "Task summary says auth work already has one failed and one successful attempt.",
         },
         [TASK_GRAPH_INDEX_METADATA_KEY]: {
@@ -310,6 +315,10 @@ describe("context snapshot builder", () => {
           messageCount: 1,
           toolCallCount: 1,
           indexedToolCallCount: 1,
+          readFilePaths: ["/README.md"],
+          editedFilePaths: ["/app/store.py"],
+          commandPreviews: ["npm test"],
+          failureHints: ["bash: boom"],
           summaryText: "Prior run fixed the middleware shape but left one validation gap.",
         },
       },
@@ -354,6 +363,15 @@ describe("context snapshot builder", () => {
       sourceRef: "run_prev",
       metadata: expect.objectContaining({ sourceType: "run-summary" }),
     });
+    expect(snapshot.blocks[0]?.content).toContain("Recent edits: /app/store.py");
+    expect(snapshot.blocks[0]?.content).toContain("Recent working set: /README.md");
+    expect(snapshot.blocks[0]?.content).toContain("Recent commands: npm test");
+    expect(snapshot.blocks[0]?.content).toContain("Known failures: bash: boom");
+    const taskBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "task");
+    expect(taskBlock?.content).toContain("Recent edits: /app/store.py");
+    expect(taskBlock?.content).toContain("Recent working set: /README.md");
+    expect(taskBlock?.content).toContain("Recent commands: npm test");
+    expect(taskBlock?.content).toContain("Latest progress: Focus on validation gap in tasks route.");
   });
 
   test("suppresses prior run summaries when context hint disables them", async () => {
@@ -376,6 +394,11 @@ describe("context snapshot builder", () => {
           messageCount: 1,
           toolCallCount: 1,
           indexedToolCallCount: 1,
+          readFilePaths: ["/README.md"],
+          editedFilePaths: ["/app/store.py"],
+          commandPreviews: ["npm test"],
+          failureHints: [],
+          assistantOutputPreview: "Focus on validation gap in tasks route.",
           summaryText: "Prior run fixed the middleware shape but left one validation gap.",
         },
       },
@@ -652,6 +675,11 @@ describe("context snapshot builder", () => {
           cancelledRunCount: 0,
           indexedToolCallCount: 1,
           latestRunIds: ["run_prev"],
+          recentReadFilePaths: ["/README.md"],
+          recentEditedFilePaths: ["/app/routes/tasks.py"],
+          recentCommandPreviews: ["pytest -q"],
+          recentFailureHints: ["pytest: one tasks-route validation still fails"],
+          latestAssistantOutputPreview: "Remaining work is isolated to tasks route validation.",
           summaryText: "Task summary says auth work already has one successful attempt.",
         },
       },

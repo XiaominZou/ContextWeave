@@ -605,6 +605,9 @@ describe("Run lifecycle", () => {
       toolCallCount: number;
       indexedToolCallCount: number;
       readFilePaths: string[];
+      editedFilePaths: string[];
+      commandPreviews: string[];
+      failureHints: string[];
       assistantOutputPreview?: string;
       summaryText: string;
     };
@@ -624,10 +627,16 @@ describe("Run lifecycle", () => {
       toolCallCount: 4,
       indexedToolCallCount: 2,
       readFilePaths: ["/README.md"],
+      editedFilePaths: ["/report.md"],
+      commandPreviews: ["npm test"],
+      failureHints: ["bash: boom"],
       assistantOutputPreview: "Final answer",
     });
     expect(summary.summaryText).toContain(handle.runId);
     expect(summary.summaryText).toContain("read files: /README.md");
+    expect(summary.summaryText).toContain("edited files: /report.md");
+    expect(summary.summaryText).toContain("commands: npm test");
+    expect(summary.summaryText).toContain("known failures: bash: boom");
 
     expect(toolRefs).toHaveLength(2);
     expect(toolRefs).toEqual(
@@ -677,6 +686,10 @@ describe("Run lifecycle", () => {
           messageCount: 1,
           toolCallCount: 1,
           indexedToolCallCount: 1,
+          readFilePaths: ["/README.md"],
+          editedFilePaths: ["/app/store.py"],
+          commandPreviews: ["npm test"],
+          failureHints: ["bash: boom"],
           assistantOutputPreview: "done",
           summaryText: "Run run_done completed cleanly.",
         },
@@ -713,6 +726,10 @@ describe("Run lifecycle", () => {
           messageCount: 0,
           toolCallCount: 0,
           indexedToolCallCount: 0,
+          readFilePaths: [],
+          editedFilePaths: [],
+          commandPreviews: [],
+          failureHints: [],
           errorCode: "UPSTREAM",
           errorMessage: "boom",
           summaryText: "Run run_fail failed with boom.",
@@ -730,6 +747,11 @@ describe("Run lifecycle", () => {
       failedRunCount: number;
       indexedToolCallCount: number;
       latestRunIds: string[];
+      recentReadFilePaths: string[];
+      recentEditedFilePaths: string[];
+      recentCommandPreviews: string[];
+      recentFailureHints: string[];
+      latestAssistantOutputPreview?: string;
       summaryText: string;
     };
 
@@ -740,9 +762,17 @@ describe("Run lifecycle", () => {
       failedRunCount: 1,
       indexedToolCallCount: 1,
       latestRunIds: ["run_fail", "run_done"],
+      recentReadFilePaths: ["/README.md"],
+      recentEditedFilePaths: ["/app/store.py"],
+      recentCommandPreviews: ["npm test"],
+      recentFailureHints: ["bash: boom"],
+      latestAssistantOutputPreview: "done",
     });
     expect(summary.summaryText).toContain("runs: 2");
     expect(summary.summaryText).toContain("runs with summaries: 2");
+    expect(summary.summaryText).toContain("recent edits: /app/store.py");
+    expect(summary.summaryText).toContain("known failures: bash: boom");
+    expect(summary.summaryText).toContain("latest progress: done");
     expect(graphIndex.latestRunIds).toEqual(["run_fail", "run_done"]);
     expect(graphIndex.dependencyTaskIds).toEqual([]);
   });

@@ -13,6 +13,9 @@ export interface RunSummaryV1 {
   toolCallCount: number;
   indexedToolCallCount: number;
   readFilePaths: string[];
+  editedFilePaths: string[];
+  commandPreviews: string[];
+  failureHints: string[];
   assistantOutputPreview?: string;
   errorCode?: string;
   errorMessage?: string;
@@ -84,6 +87,9 @@ export function buildRunDerivedContext(input: {
     .map((callEvent) => buildToolCallRef(callEvent, toolResults.get(readString(callEvent.payload, "callId") ?? "")))
     .filter((value): value is ToolCallRefV1 => Boolean(value));
   const readFilePaths = collectReadFilePaths(toolCalls, toolResults);
+  const editedFilePaths = collectEditedFilePaths(toolCalls, toolResults);
+  const commandPreviews = collectCommandPreviews(toolCalls, toolResults);
+  const failureHints = collectFailureHints(toolCalls, toolResults);
 
   const assistantOutputPreview = truncate(joinAssistantOutput(assistantChunks), 240);
   return {
@@ -96,6 +102,9 @@ export function buildRunDerivedContext(input: {
       toolCallCount: toolCalls.size,
       indexedToolCallCount: toolCallRefs.length,
       readFilePaths,
+      editedFilePaths,
+      commandPreviews,
+      failureHints,
       assistantOutputPreview: assistantOutputPreview || undefined,
       errorCode: input.run.error?.code,
       errorMessage: input.run.error?.message,
@@ -106,6 +115,9 @@ export function buildRunDerivedContext(input: {
         toolCallCount: toolCalls.size,
         indexedToolCallCount: toolCallRefs.length,
         readFilePaths,
+        editedFilePaths,
+        commandPreviews,
+        failureHints,
       }),
     },
     toolCallRefs,
@@ -151,6 +163,9 @@ function buildRunSummaryText(input: {
   toolCallCount: number;
   indexedToolCallCount: number;
   readFilePaths: string[];
+  editedFilePaths: string[];
+  commandPreviews: string[];
+  failureHints: string[];
 }): string {
   const fragments = [
     `Run ${input.run.id} ${input.run.status}`,
@@ -158,6 +173,9 @@ function buildRunSummaryText(input: {
     `tool calls: ${input.toolCallCount}`,
     `indexed tool refs: ${input.indexedToolCallCount}`,
     input.readFilePaths.length > 0 ? `read files: ${input.readFilePaths.join(", ")}` : undefined,
+    input.editedFilePaths.length > 0 ? `edited files: ${input.editedFilePaths.join(", ")}` : undefined,
+    input.commandPreviews.length > 0 ? `commands: ${input.commandPreviews.join(" | ")}` : undefined,
+    input.failureHints.length > 0 ? `known failures: ${input.failureHints.join(" | ")}` : undefined,
     input.assistantOutputPreview ? `assistant output: ${input.assistantOutputPreview}` : undefined,
   ].filter((value): value is string => Boolean(value));
   return fragments.join("; ");
@@ -280,6 +298,92 @@ function collectReadFilePaths(
   return [...paths];
 }
 
+function collectEditedFilePaths(
+  toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
+  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+): string[] {
+  const paths = new Set<string>();
+
+  for (const callEvent of toolCalls.values()) {
+    const toolName = readString(callEvent.payload, "name");
+    if (toolName !== "edit" && toolName !== "write" && toolName !== "write_file") {
+      continue;
+    }
+
+    const callId = readString(callEvent.payload, "callId") ?? callEvent.id;
+    const resultEvent = toolResults.get(callId);
+    if (resultEvent && readBoolean(resultEvent.payload, "isError")) {
+      continue;
+    }
+
+    const filePath = readReadFilePath(readValue(callEvent.payload, "input"));
+    if (!filePath) {
+      continue;
+    }
+
+    paths.add(normalizeContextFilePath(filePath));
+  }
+
+  return [...paths];
+}
+
+function collectCommandPreviews(
+  toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
+  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+): string[] {
+  const previews = new Set<string>();
+
+  for (const callEvent of toolCalls.values()) {
+    const toolName = readString(callEvent.payload, "name");
+    if (toolName !== "bash") {
+      continue;
+    }
+
+    const preview = readCommandPreview(readValue(callEvent.payload, "input"));
+    if (!preview) {
+      continue;
+    }
+
+    previews.add(preview);
+    if (previews.size >= 3) {
+      break;
+    }
+  }
+
+  return [...previews];
+}
+
+function collectFailureHints(
+  toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
+  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+): string[] {
+  const hints = new Set<string>();
+
+  for (const callEvent of toolCalls.values()) {
+    const callId = readString(callEvent.payload, "callId") ?? callEvent.id;
+    const resultEvent = toolResults.get(callId);
+    if (!resultEvent) {
+      continue;
+    }
+
+    const toolName = readString(callEvent.payload, "name") ?? "unknown_tool";
+    const outputPreview = renderFailurePreview(readValue(resultEvent.payload, "output"));
+    const isError = readBoolean(resultEvent.payload, "isError") ?? false;
+
+    if (!isError && !(toolName === "bash" && looksLikeFailurePreview(outputPreview))) {
+      continue;
+    }
+
+    const hint = outputPreview ? `${toolName}: ${outputPreview}` : `${toolName} failed`;
+    hints.add(truncate(hint, 140));
+    if (hints.size >= 3) {
+      break;
+    }
+  }
+
+  return [...hints];
+}
+
 function readReadFilePath(value: unknown): string | undefined {
   if (!value || typeof value !== "object") {
     return undefined;
@@ -288,4 +392,58 @@ function readReadFilePath(value: unknown): string | undefined {
   const record = value as Record<string, unknown>;
   const pathValue = record.filePath ?? record.path ?? record.file ?? record.pathname;
   return typeof pathValue === "string" && pathValue.trim().length > 0 ? pathValue : undefined;
+}
+
+function readCommandPreview(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const command = typeof record.command === "string" ? record.command.trim() : "";
+  if (!command) {
+    return undefined;
+  }
+
+  return truncate(command.replace(/\s+/g, " "), 80);
+}
+
+function renderFailurePreview(value: unknown): string {
+  if (typeof value === "string") {
+    return truncate(value.replace(/\s+/g, " ").trim(), 120);
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  const record = value as Record<string, unknown>;
+  const direct =
+    firstString(record.message, record.error, record.stderr, record.stdout, record.detail, record.summary) ??
+    firstString(readNestedRecordString(record.output, "message"), readNestedRecordString(record.output, "stderr"), readNestedRecordString(record.output, "stdout"));
+  if (direct) {
+    return truncate(direct.replace(/\s+/g, " ").trim(), 120);
+  }
+
+  return truncate(renderPreview(value), 120);
+}
+
+function looksLikeFailurePreview(value: string): boolean {
+  return /fail|error|traceback|assert|exception|not found|invalid/i.test(value);
+}
+
+function readNestedRecordString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const nested = (value as Record<string, unknown>)[key];
+  return typeof nested === "string" ? nested : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }

@@ -14,6 +14,11 @@ export interface TaskSummaryV1 {
   cancelledRunCount: number;
   indexedToolCallCount: number;
   latestRunIds: string[];
+  recentReadFilePaths: string[];
+  recentEditedFilePaths: string[];
+  recentCommandPreviews: string[];
+  recentFailureHints: string[];
+  latestAssistantOutputPreview?: string;
   summaryText: string;
 }
 
@@ -27,6 +32,11 @@ export function buildTaskDerivedContext(input: { task: Task; runs: Run[] }): { t
   const runSummaries = sortedRuns
     .map((run) => readRunSummary(run))
     .filter((summary): summary is RunSummaryV1 => Boolean(summary));
+  const recentReadFilePaths = collectRecentFilePaths(runSummaries, "readFilePaths");
+  const recentEditedFilePaths = collectRecentFilePaths(runSummaries, "editedFilePaths");
+  const recentCommandPreviews = collectRecentCommandPreviews(runSummaries);
+  const recentFailureHints = collectRecentFailureHints(runSummaries);
+  const latestAssistantOutputPreview = runSummaries.find((summary) => summary.assistantOutputPreview)?.assistantOutputPreview;
 
   const indexedToolCallCount = sortedRuns.reduce((sum, run) => sum + readToolCallRefs(run).length, 0);
   const taskSummary: TaskSummaryV1 = {
@@ -39,11 +49,21 @@ export function buildTaskDerivedContext(input: { task: Task; runs: Run[] }): { t
     cancelledRunCount: input.runs.filter((run) => run.status === "cancelled").length,
     indexedToolCallCount,
     latestRunIds: sortedRuns.slice(0, 3).map((run) => run.id),
+    recentReadFilePaths,
+    recentEditedFilePaths,
+    recentCommandPreviews,
+    recentFailureHints,
+    latestAssistantOutputPreview,
     summaryText: buildTaskSummaryText({
       task: input.task,
       runs: sortedRuns,
       runSummaries,
       indexedToolCallCount,
+      recentReadFilePaths,
+      recentEditedFilePaths,
+      recentCommandPreviews,
+      recentFailureHints,
+      latestAssistantOutputPreview,
     }),
   };
 
@@ -70,6 +90,11 @@ function buildTaskSummaryText(input: {
   runs: Run[];
   runSummaries: RunSummaryV1[];
   indexedToolCallCount: number;
+  recentReadFilePaths: string[];
+  recentEditedFilePaths: string[];
+  recentCommandPreviews: string[];
+  recentFailureHints: string[];
+  latestAssistantOutputPreview?: string;
 }): string {
   const fragments = [
     `Task ${input.task.id} ${input.task.status}`,
@@ -79,8 +104,67 @@ function buildTaskSummaryText(input: {
     input.runs.some((run) => run.status === "cancelled") ? `cancelled: ${input.runs.filter((run) => run.status === "cancelled").length}` : undefined,
     input.indexedToolCallCount > 0 ? `indexed tool refs: ${input.indexedToolCallCount}` : undefined,
     input.runSummaries.length > 0 ? `runs with summaries: ${input.runSummaries.length}` : undefined,
+    input.recentReadFilePaths.length > 0 ? `recent reads: ${input.recentReadFilePaths.join(", ")}` : undefined,
+    input.recentEditedFilePaths.length > 0 ? `recent edits: ${input.recentEditedFilePaths.join(", ")}` : undefined,
+    input.recentCommandPreviews.length > 0 ? `recent commands: ${input.recentCommandPreviews.join(" | ")}` : undefined,
+    input.recentFailureHints.length > 0 ? `known failures: ${input.recentFailureHints.join(" | ")}` : undefined,
+    input.latestAssistantOutputPreview ? `latest progress: ${input.latestAssistantOutputPreview}` : undefined,
   ].filter((value): value is string => Boolean(value));
   return fragments.join("; ");
+}
+
+function collectRecentFilePaths(
+  runSummaries: RunSummaryV1[],
+  field: "readFilePaths" | "editedFilePaths",
+): string[] {
+  const values = new Set<string>();
+  for (const summary of runSummaries) {
+    const paths = Array.isArray(summary[field]) ? summary[field] : [];
+    for (const path of paths) {
+      if (!path) {
+        continue;
+      }
+      values.add(path);
+      if (values.size >= 5) {
+        return [...values];
+      }
+    }
+  }
+  return [...values];
+}
+
+function collectRecentCommandPreviews(runSummaries: RunSummaryV1[]): string[] {
+  const values = new Set<string>();
+  for (const summary of runSummaries) {
+    const commands = Array.isArray(summary.commandPreviews) ? summary.commandPreviews : [];
+    for (const command of commands) {
+      if (!command) {
+        continue;
+      }
+      values.add(command);
+      if (values.size >= 3) {
+        return [...values];
+      }
+    }
+  }
+  return [...values];
+}
+
+function collectRecentFailureHints(runSummaries: RunSummaryV1[]): string[] {
+  const values = new Set<string>();
+  for (const summary of runSummaries) {
+    const hints = Array.isArray(summary.failureHints) ? summary.failureHints : [];
+    for (const hint of hints) {
+      if (!hint) {
+        continue;
+      }
+      values.add(hint);
+      if (values.size >= 4) {
+        return [...values];
+      }
+    }
+  }
+  return [...values];
 }
 
 function runSortTimestamp(run: Run): string {
