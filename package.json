@@ -19,6 +19,7 @@
                     "benchmark:opencode:real-benchmark-smoke":  "npm run build && tsx packages/benchmark/scripts/run-opencode-real-benchmark.ts --smoke",
                     "benchmark:opencode:warm-benchmark":  "npm run build && tsx packages/benchmark/scripts/run-opencode-warm-benchmark.ts",
                     "benchmark:opencode:warm-benchmark-smoke":  "npm run build && tsx packages/benchmark/scripts/run-opencode-warm-benchmark.ts --smoke",
+                    "benchmark:demo-page":  "node scripts/generate-benchmark-demo.mjs",
                     "openclaw:daemon":  "node --experimental-strip-types --loader ./scripts/ctx-node-loader.mjs scripts/openclaw-platform-daemon.mjs",
                     "openclaw:install-plugin":  "node scripts/install-openclaw-plugin.mjs",
                     "opencode:daemon":  "node scripts/opencode-platform-daemon.mjs",

@@ -294,14 +294,22 @@ async function collectMemoryBlocks(input: ContextCollectorInput): Promise<Contex
 function buildTaskContextBlock(task: Task): ContextBlock {
   const nativeMirror = readNativeTaskMirror(task);
   const taskSummary = readTaskSummary(task);
+  const repairState = taskSummary?.repairState;
+  const fallbackFailureHints = filterFallbackFailureHints(taskSummary?.recentFailureHints ?? [], repairState);
   const lines = [
     `[TASK] ${task.title}`,
     task.objective ? `Objective: ${task.objective}` : undefined,
     task.instructions ? `Instructions: ${task.instructions}` : undefined,
-    taskSummary?.recentEditedFilePaths?.length ? `Recent edits: ${taskSummary.recentEditedFilePaths.join(", ")}` : undefined,
+    taskSummary?.recentEditedFilePaths?.length
+      ? `${repairState ? "Likely target files" : "Recent edits"}: ${taskSummary.recentEditedFilePaths.join(", ")}`
+      : undefined,
     taskSummary?.recentReadFilePaths?.length ? `Recent working set: ${taskSummary.recentReadFilePaths.join(", ")}` : undefined,
-    taskSummary?.recentCommandPreviews?.length ? `Recent commands: ${taskSummary.recentCommandPreviews.join(" | ")}` : undefined,
-    taskSummary?.recentFailureHints?.length ? `Known failures: ${taskSummary.recentFailureHints.join(" | ")}` : undefined,
+    repairState?.failingTests?.length ? `Failing tests: ${repairState.failingTests.join(", ")}` : undefined,
+    repairState?.lastTestCommand ? `Last failing command: ${repairState.lastTestCommand}` : undefined,
+    repairState?.unresolvedConstraints?.length
+      ? `Unresolved constraints: ${repairState.unresolvedConstraints.join("; ")}`
+      : undefined,
+    fallbackFailureHints.length ? `Known failures: ${fallbackFailureHints.join(" | ")}` : undefined,
     taskSummary?.latestAssistantOutputPreview ? `Latest progress: ${taskSummary.latestAssistantOutputPreview}` : undefined,
     nativeMirror ? `Native mirror: ${nativeMirror.summaryText}` : undefined,
     nativeMirror?.currentFocus ? `Current focus: ${nativeMirror.currentFocus}` : undefined,
@@ -459,5 +467,21 @@ function sortRunByRecency(run: Run): string {
 
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function filterFallbackFailureHints(
+  hints: string[],
+  repairState?: { failingTests?: string[]; lastTestCommand?: string; unresolvedConstraints?: string[] },
+): string[] {
+  const hasRepairState = Boolean(
+    repairState &&
+      ((repairState.failingTests?.length ?? 0) > 0 ||
+        (repairState.unresolvedConstraints?.length ?? 0) > 0 ||
+        repairState.lastTestCommand),
+  );
+  if (!hasRepairState) {
+    return hints;
+  }
+  return hints.filter((hint) => !/^(bash|pytest):/i.test(hint) && !/AssertionError:|(?:^|\s)assert\s+/i.test(hint) && !hint.includes("::"));
 }
 

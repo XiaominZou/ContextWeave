@@ -559,8 +559,18 @@ describe("Run lifecycle", () => {
         new RawMockAdapter({
           rawEvents: [
             { type: "run_started", model: "mock-model" },
-            { type: "tool_call", callId: "call_error", name: "bash", input: { command: "npm test" } },
-            { type: "tool_result", callId: "call_error", output: { message: "boom" }, isError: true },
+            { type: "tool_call", callId: "call_error", name: "bash", input: { command: "python -m pytest tests/ -q" } },
+            {
+              type: "tool_result",
+              callId: "call_error",
+              output: {
+                stdout: [
+                  "FAILED tests/test_tasks.py::test_duplicate_tags_returns_422",
+                  "E AssertionError: duplicate tags should return 422",
+                ].join("\n"),
+              },
+              isError: true,
+            },
             { type: "tool_call", callId: "call_artifact", name: "write_file", input: { path: "report.md" } },
             { type: "tool_result", callId: "call_artifact", output: { artifactId: "art_1", artifacts: [{ id: "art_2" }] } },
             { type: "tool_call", callId: "call_read", name: "read", input: { filePath: "C:\\tmp\\ctx-benchmark-fixture\\minikanban\\README.md" } },
@@ -607,6 +617,11 @@ describe("Run lifecycle", () => {
       readFilePaths: string[];
       editedFilePaths: string[];
       commandPreviews: string[];
+      repairState?: {
+        failingTests: string[];
+        lastTestCommand?: string;
+        unresolvedConstraints: string[];
+      };
       failureHints: string[];
       assistantOutputPreview?: string;
       summaryText: string;
@@ -628,15 +643,22 @@ describe("Run lifecycle", () => {
       indexedToolCallCount: 2,
       readFilePaths: ["/README.md"],
       editedFilePaths: ["/report.md"],
-      commandPreviews: ["npm test"],
-      failureHints: ["bash: boom"],
+      commandPreviews: ["python -m pytest tests/ -q"],
+      repairState: {
+        failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+        lastTestCommand: "python -m pytest tests/ -q",
+        unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+      },
+      failureHints: [],
       assistantOutputPreview: "Final answer",
     });
     expect(summary.summaryText).toContain(handle.runId);
     expect(summary.summaryText).toContain("read files: /README.md");
     expect(summary.summaryText).toContain("edited files: /report.md");
-    expect(summary.summaryText).toContain("commands: npm test");
-    expect(summary.summaryText).toContain("known failures: bash: boom");
+    expect(summary.summaryText).toContain("commands: python -m pytest tests/ -q");
+    expect(summary.summaryText).toContain("failing tests: tests/test_tasks.py::test_duplicate_tags_returns_422");
+    expect(summary.summaryText).toContain("last failing command: python -m pytest tests/ -q");
+    expect(summary.summaryText).toContain("unresolved constraints: AssertionError: duplicate tags should return 422");
 
     expect(toolRefs).toHaveLength(2);
     expect(toolRefs).toEqual(
@@ -646,7 +668,7 @@ describe("Run lifecycle", () => {
           toolName: "bash",
           isError: true,
           hasArtifact: false,
-          inputSignature: 'bash:{"command":"npm test"}',
+          inputSignature: 'bash:{"command":"python -m pytest tests/ -q"}',
         }),
         expect.objectContaining({
           callId: "call_artifact",
@@ -689,7 +711,13 @@ describe("Run lifecycle", () => {
           readFilePaths: ["/README.md"],
           editedFilePaths: ["/app/store.py"],
           commandPreviews: ["npm test"],
-          failureHints: ["bash: boom"],
+          repairState: {
+            version: "1",
+            failingTests: [],
+            lastTestCommand: "npm test",
+            unresolvedConstraints: ["AssertionError: task title should remain immutable once done"],
+          },
+          failureHints: ["write_file: permission denied"],
           assistantOutputPreview: "done",
           summaryText: "Run run_done completed cleanly.",
         },
@@ -728,7 +756,13 @@ describe("Run lifecycle", () => {
           indexedToolCallCount: 0,
           readFilePaths: [],
           editedFilePaths: [],
-          commandPreviews: [],
+          commandPreviews: ["python -m pytest tests/ -q"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+            lastTestCommand: "python -m pytest tests/ -q",
+            unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+          },
           failureHints: [],
           errorCode: "UPSTREAM",
           errorMessage: "boom",
@@ -750,6 +784,11 @@ describe("Run lifecycle", () => {
       recentReadFilePaths: string[];
       recentEditedFilePaths: string[];
       recentCommandPreviews: string[];
+      repairState?: {
+        failingTests: string[];
+        lastTestCommand?: string;
+        unresolvedConstraints: string[];
+      };
       recentFailureHints: string[];
       latestAssistantOutputPreview?: string;
       summaryText: string;
@@ -764,14 +803,25 @@ describe("Run lifecycle", () => {
       latestRunIds: ["run_fail", "run_done"],
       recentReadFilePaths: ["/README.md"],
       recentEditedFilePaths: ["/app/store.py"],
-      recentCommandPreviews: ["npm test"],
-      recentFailureHints: ["bash: boom"],
+      recentCommandPreviews: ["python -m pytest tests/ -q", "npm test"],
+      repairState: {
+        failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+        lastTestCommand: "python -m pytest tests/ -q",
+        unresolvedConstraints: [
+          "AssertionError: duplicate tags should return 422",
+          "AssertionError: task title should remain immutable once done",
+        ],
+      },
+      recentFailureHints: ["write_file: permission denied"],
       latestAssistantOutputPreview: "done",
     });
     expect(summary.summaryText).toContain("runs: 2");
     expect(summary.summaryText).toContain("runs with summaries: 2");
     expect(summary.summaryText).toContain("recent edits: /app/store.py");
-    expect(summary.summaryText).toContain("known failures: bash: boom");
+    expect(summary.summaryText).toContain("failing tests: tests/test_tasks.py::test_duplicate_tags_returns_422");
+    expect(summary.summaryText).toContain("last failing command: python -m pytest tests/ -q");
+    expect(summary.summaryText).toContain("unresolved constraints: AssertionError: duplicate tags should return 422 | AssertionError: task title should remain immutable once done");
+    expect(summary.summaryText).toContain("known failures: write_file: permission denied");
     expect(summary.summaryText).toContain("latest progress: done");
     expect(graphIndex.latestRunIds).toEqual(["run_fail", "run_done"]);
     expect(graphIndex.dependencyTaskIds).toEqual([]);

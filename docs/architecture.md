@@ -49,8 +49,76 @@ Business App
      -> create adapter run
      -> capture, normalize, store, and emit events
      -> auto-close run on terminal event
-     -> optionally extract memory asynchronously after completion
+      -> optionally extract memory asynchronously after completion
 ```
+
+### 2.1 Agent-First Target Topology
+
+The product target for transparent runtime integration is not only
+`platform -> agent`.
+
+For OpenCode and OpenClaw, the intended user-facing topology is:
+
+```text
+                                User
+                                 |
+                +----------------+----------------+
+                |                                 |
+                v                                 v
+         +--------------+                  +--------------+
+         | OpenCode CLI |                  | OpenClaw CLI |
+         | / UI / Hooks |                  | / UI / Hooks |
+         +------+-------+                  +------+-------+
+                |                                 |
+                | native user turn / runtime state|
+                +----------------+----------------+
+                                 |
+                                 v
+              +-------------------------------------------+
+              | Agent Hook / Bridge Layer                 |
+              |-------------------------------------------|
+              | - runtime plugin / hook                   |
+              | - attach workspace and native session ref |
+              | - send current turn to platform           |
+              | - receive platform-owned context          |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+              +-------------------------------------------+
+              | Context Platform Gateway                  |
+              |-------------------------------------------|
+              | - ingress for agent-originated requests   |
+              | - bind workspace / session / task / run   |
+              | - accept post-turn messages and events    |
+              | - return assembled context before turn    |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+              +-------------------------------------------+
+              | Context Platform Core                     |
+              |-------------------------------------------|
+              | - canonical Session / Task / Run          |
+              | - context assembly                        |
+              | - memory retrieval and consolidation      |
+              | - summaries / graph / pruning             |
+              | - artifacts / checkpoints / audit trail   |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+                platform-owned context back into agent turn
+```
+
+This means the CLI remains the user entry point, while the platform becomes
+the context control plane behind both agent runtimes.
+
+### 2.2 Ownership Split In The Target Shape
+
+In this target shape:
+
+- OpenCode and OpenClaw still own native model execution and native UX
+- the platform owns canonical `Session`, `Task`, `Run`, memory, and context assembly
+- hooks and bridge layers are transport surfaces, not canonical storage
+- native runtime session/todo/history may remain runtime-local mirrors until a deeper takeover exists
 
 
 ## 3. Main Components

@@ -4,6 +4,13 @@ import { extractArtifactIds } from "./artifact-records";
 export const RUN_SUMMARY_METADATA_KEY = "platformRunSummary";
 export const TOOL_CALL_REFS_METADATA_KEY = "platformToolCallRefs";
 
+export interface RepairStateV1 {
+  version: "1";
+  failingTests: string[];
+  lastTestCommand?: string;
+  unresolvedConstraints: string[];
+}
+
 export interface RunSummaryV1 {
   version: "1";
   generatedAt: string;
@@ -15,6 +22,7 @@ export interface RunSummaryV1 {
   readFilePaths: string[];
   editedFilePaths: string[];
   commandPreviews: string[];
+  repairState?: RepairStateV1;
   failureHints: string[];
   assistantOutputPreview?: string;
   errorCode?: string;
@@ -88,8 +96,9 @@ export function buildRunDerivedContext(input: {
     .filter((value): value is ToolCallRefV1 => Boolean(value));
   const readFilePaths = collectReadFilePaths(toolCalls, toolResults);
   const editedFilePaths = collectEditedFilePaths(toolCalls, toolResults);
-  const commandPreviews = collectCommandPreviews(toolCalls, toolResults);
-  const failureHints = collectFailureHints(toolCalls, toolResults);
+  const commandPreviews = collectCommandPreviews(toolCalls);
+  const repairStateMatch = collectRepairState(toolCalls, toolResults);
+  const failureHints = collectFailureHints(toolCalls, toolResults, repairStateMatch?.sourceCallId);
 
   const assistantOutputPreview = truncate(joinAssistantOutput(assistantChunks), 240);
   return {
@@ -104,6 +113,7 @@ export function buildRunDerivedContext(input: {
       readFilePaths,
       editedFilePaths,
       commandPreviews,
+      repairState: repairStateMatch?.repairState,
       failureHints,
       assistantOutputPreview: assistantOutputPreview || undefined,
       errorCode: input.run.error?.code,
@@ -117,6 +127,7 @@ export function buildRunDerivedContext(input: {
         readFilePaths,
         editedFilePaths,
         commandPreviews,
+        repairState: repairStateMatch?.repairState,
         failureHints,
       }),
     },
@@ -165,6 +176,7 @@ function buildRunSummaryText(input: {
   readFilePaths: string[];
   editedFilePaths: string[];
   commandPreviews: string[];
+  repairState?: RepairStateV1;
   failureHints: string[];
 }): string {
   const fragments = [
@@ -175,6 +187,11 @@ function buildRunSummaryText(input: {
     input.readFilePaths.length > 0 ? `read files: ${input.readFilePaths.join(", ")}` : undefined,
     input.editedFilePaths.length > 0 ? `edited files: ${input.editedFilePaths.join(", ")}` : undefined,
     input.commandPreviews.length > 0 ? `commands: ${input.commandPreviews.join(" | ")}` : undefined,
+    input.repairState?.failingTests.length ? `failing tests: ${input.repairState.failingTests.join(", ")}` : undefined,
+    input.repairState?.lastTestCommand ? `last failing command: ${input.repairState.lastTestCommand}` : undefined,
+    input.repairState?.unresolvedConstraints.length
+      ? `unresolved constraints: ${input.repairState.unresolvedConstraints.join(" | ")}`
+      : undefined,
     input.failureHints.length > 0 ? `known failures: ${input.failureHints.join(" | ")}` : undefined,
     input.assistantOutputPreview ? `assistant output: ${input.assistantOutputPreview}` : undefined,
   ].filter((value): value is string => Boolean(value));
@@ -329,11 +346,10 @@ function collectEditedFilePaths(
 
 function collectCommandPreviews(
   toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
-  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
 ): string[] {
   const previews = new Set<string>();
 
-  for (const callEvent of toolCalls.values()) {
+  for (const callEvent of [...toolCalls.values()].reverse()) {
     const toolName = readString(callEvent.payload, "name");
     if (toolName !== "bash") {
       continue;
@@ -353,9 +369,53 @@ function collectCommandPreviews(
   return [...previews];
 }
 
+function collectRepairState(
+  toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
+  toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+): { repairState: RepairStateV1; sourceCallId: string } | undefined {
+  for (const callEvent of [...toolCalls.values()].reverse()) {
+    if (readString(callEvent.payload, "name") !== "bash") {
+      continue;
+    }
+
+    const command = readCommandPreview(readValue(callEvent.payload, "input"));
+    if (!command || !isTestCommand(command)) {
+      continue;
+    }
+
+    const callId = readString(callEvent.payload, "callId") ?? callEvent.id;
+    const resultEvent = toolResults.get(callId);
+    if (!resultEvent) {
+      continue;
+    }
+
+    const outputText = readOutputText(readValue(resultEvent.payload, "output"));
+    const failingTests = extractFailingTests(outputText);
+    const unresolvedConstraints = extractUnresolvedConstraints(outputText);
+    const isError = readBoolean(resultEvent.payload, "isError") ?? false;
+
+    if (failingTests.length === 0 && unresolvedConstraints.length === 0 && !isError) {
+      continue;
+    }
+
+    return {
+      sourceCallId: callId,
+      repairState: {
+        version: "1",
+        failingTests,
+        lastTestCommand: command,
+        unresolvedConstraints,
+      },
+    };
+  }
+
+  return undefined;
+}
+
 function collectFailureHints(
   toolCalls: Map<string, AgentEventEnvelope<{ callId: string; name: string; input: unknown }>>,
   toolResults: Map<string, AgentEventEnvelope<{ callId: string; output: unknown; isError?: boolean }>>,
+  repairStateSourceCallId?: string,
 ): string[] {
   const hints = new Set<string>();
 
@@ -367,8 +427,19 @@ function collectFailureHints(
     }
 
     const toolName = readString(callEvent.payload, "name") ?? "unknown_tool";
-    const outputPreview = renderFailurePreview(readValue(resultEvent.payload, "output"));
+    const outputValue = readValue(resultEvent.payload, "output");
+    const outputPreview = renderFailurePreview(outputValue);
     const isError = readBoolean(resultEvent.payload, "isError") ?? false;
+    const commandPreview = toolName === "bash" ? readCommandPreview(readValue(callEvent.payload, "input")) : undefined;
+    const isTestFailureCall =
+      toolName === "bash" &&
+      typeof commandPreview === "string" &&
+      isTestCommand(commandPreview) &&
+      looksLikeTestFailureOutput(readOutputText(outputValue));
+
+    if (callId === repairStateSourceCallId || isTestFailureCall) {
+      continue;
+    }
 
     if (!isError && !(toolName === "bash" && looksLikeFailurePreview(outputPreview))) {
       continue;
@@ -408,20 +479,37 @@ function readCommandPreview(value: unknown): string | undefined {
   return truncate(command.replace(/\s+/g, " "), 80);
 }
 
-function renderFailurePreview(value: unknown): string {
+function readOutputText(value: unknown): string {
   if (typeof value === "string") {
-    return truncate(value.replace(/\s+/g, " ").trim(), 120);
+    return value.trim();
   }
   if (!value || typeof value !== "object") {
     return "";
   }
 
   const record = value as Record<string, unknown>;
-  const direct =
-    firstString(record.message, record.error, record.stderr, record.stdout, record.detail, record.summary) ??
-    firstString(readNestedRecordString(record.output, "message"), readNestedRecordString(record.output, "stderr"), readNestedRecordString(record.output, "stdout"));
-  if (direct) {
-    return truncate(direct.replace(/\s+/g, " ").trim(), 120);
+  return (
+    firstString(
+      record.message,
+      record.error,
+      record.stderr,
+      record.stdout,
+      record.detail,
+      record.summary,
+      readNestedRecordString(record.output, "message"),
+      readNestedRecordString(record.output, "stderr"),
+      readNestedRecordString(record.output, "stdout"),
+    ) ?? ""
+  ).trim();
+}
+
+function renderFailurePreview(value: unknown): string {
+  const outputText = readOutputText(value);
+  if (outputText) {
+    return truncate(outputText.replace(/\s+/g, " ").trim(), 120);
+  }
+  if (!value || typeof value !== "object") {
+    return "";
   }
 
   return truncate(renderPreview(value), 120);
@@ -429,6 +517,50 @@ function renderFailurePreview(value: unknown): string {
 
 function looksLikeFailurePreview(value: string): boolean {
   return /fail|error|traceback|assert|exception|not found|invalid/i.test(value);
+}
+
+function looksLikeTestFailureOutput(value: string): boolean {
+  return /^FAILED\s+\S+/m.test(value) || /AssertionError:|(?:^|\n)\s*assert\s+/m.test(value);
+}
+
+function isTestCommand(value: string): boolean {
+  return /\b(?:pytest|python\s+-m\s+pytest|uv\s+run\s+pytest|poetry\s+run\s+pytest|pnpm\s+test|npm\s+test|yarn\s+test|vitest|cargo\s+test)\b/i.test(value);
+}
+
+function extractFailingTests(value: string): string[] {
+  const matches = new Set<string>();
+  for (const match of value.matchAll(/^FAILED\s+(\S+)/gm)) {
+    const testName = match[1]?.trim();
+    if (testName) {
+      matches.add(testName);
+    }
+  }
+  return [...matches].slice(0, 5);
+}
+
+function extractUnresolvedConstraints(value: string): string[] {
+  const matches = new Set<string>();
+  for (const match of value.matchAll(/^(?:E\s+)?(AssertionError:[^\n]{1,120})$/gm)) {
+    const constraint = normalizeConstraintLine(match[1]);
+    if (constraint) {
+      matches.add(constraint);
+    }
+  }
+  for (const match of value.matchAll(/^(?:E\s+)?(assert [^\n]{1,120})$/gm)) {
+    const constraint = normalizeConstraintLine(match[1]);
+    if (constraint) {
+      matches.add(constraint);
+    }
+  }
+  return [...matches].slice(0, 4);
+}
+
+function normalizeConstraintLine(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? truncate(normalized, 120) : undefined;
 }
 
 function readNestedRecordString(value: unknown, key: string): string | undefined {

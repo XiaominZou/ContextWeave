@@ -283,7 +283,13 @@ describe("context snapshot builder", () => {
           recentReadFilePaths: ["/README.md"],
           recentEditedFilePaths: ["/app/store.py"],
           recentCommandPreviews: ["npm test"],
-          recentFailureHints: ["bash: boom"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+            lastTestCommand: "python -m pytest tests/ -q",
+            unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+          },
+          recentFailureHints: ["write_file: permission denied"],
           latestAssistantOutputPreview: "Focus on validation gap in tasks route.",
           summaryText: "Task summary says auth work already has one failed and one successful attempt.",
         },
@@ -317,8 +323,14 @@ describe("context snapshot builder", () => {
           indexedToolCallCount: 1,
           readFilePaths: ["/README.md"],
           editedFilePaths: ["/app/store.py"],
-          commandPreviews: ["npm test"],
-          failureHints: ["bash: boom"],
+          commandPreviews: ["python -m pytest tests/ -q"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+            lastTestCommand: "python -m pytest tests/ -q",
+            unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+          },
+          failureHints: ["write_file: permission denied"],
           summaryText: "Prior run fixed the middleware shape but left one validation gap.",
         },
       },
@@ -363,14 +375,16 @@ describe("context snapshot builder", () => {
       sourceRef: "run_prev",
       metadata: expect.objectContaining({ sourceType: "run-summary" }),
     });
-    expect(snapshot.blocks[0]?.content).toContain("Recent edits: /app/store.py");
+    expect(snapshot.blocks[0]?.content).toContain("Likely target files: /app/store.py");
     expect(snapshot.blocks[0]?.content).toContain("Recent working set: /README.md");
-    expect(snapshot.blocks[0]?.content).toContain("Recent commands: npm test");
-    expect(snapshot.blocks[0]?.content).toContain("Known failures: bash: boom");
+    expect(snapshot.blocks[0]?.content).toContain("Failing tests: tests/test_tasks.py::test_duplicate_tags_returns_422");
+    expect(snapshot.blocks[0]?.content).toContain("Last failing command: python -m pytest tests/ -q");
+    expect(snapshot.blocks[0]?.content).toContain("Unresolved constraints: AssertionError: duplicate tags should return 422");
+    expect(snapshot.blocks[0]?.content).toContain("Known failures: write_file: permission denied");
     const taskBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "task");
-    expect(taskBlock?.content).toContain("Recent edits: /app/store.py");
+    expect(taskBlock?.content).toContain("Likely target files: /app/store.py");
     expect(taskBlock?.content).toContain("Recent working set: /README.md");
-    expect(taskBlock?.content).toContain("Recent commands: npm test");
+    expect(taskBlock?.content).toContain("Failing tests: tests/test_tasks.py::test_duplicate_tags_returns_422");
     expect(taskBlock?.content).toContain("Latest progress: Focus on validation gap in tasks route.");
   });
 
@@ -397,6 +411,12 @@ describe("context snapshot builder", () => {
           readFilePaths: ["/README.md"],
           editedFilePaths: ["/app/store.py"],
           commandPreviews: ["npm test"],
+          repairState: {
+            version: "1",
+            failingTests: [],
+            lastTestCommand: "npm test",
+            unresolvedConstraints: ["AssertionError: some validation still fails"],
+          },
           failureHints: [],
           assistantOutputPreview: "Focus on validation gap in tasks route.",
           summaryText: "Prior run fixed the middleware shape but left one validation gap.",
@@ -678,7 +698,13 @@ describe("context snapshot builder", () => {
           recentReadFilePaths: ["/README.md"],
           recentEditedFilePaths: ["/app/routes/tasks.py"],
           recentCommandPreviews: ["pytest -q"],
-          recentFailureHints: ["pytest: one tasks-route validation still fails"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_tasks_route_validation"],
+            lastTestCommand: "pytest -q",
+            unresolvedConstraints: ["AssertionError: tasks route validation should return 422"],
+          },
+          recentFailureHints: [],
           latestAssistantOutputPreview: "Remaining work is isolated to tasks route validation.",
           summaryText: "Task summary says auth work already has one successful attempt.",
         },

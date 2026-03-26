@@ -49,6 +49,73 @@
 ```
 
 
+### 2.1 Agent-first 目标拓扑
+
+对于 OpenCode 和 OpenClaw，产品目标不应该只停留在
+`platform -> agent`。
+
+更合适的目标拓扑是：
+
+```text
+                                User
+                                 |
+                +----------------+----------------+
+                |                                 |
+                v                                 v
+         +--------------+                  +--------------+
+         | OpenCode CLI |                  | OpenClaw CLI |
+         | / UI / Hooks |                  | / UI / Hooks |
+         +------+-------+                  +------+-------+
+                |                                 |
+                | native user turn / runtime state|
+                +----------------+----------------+
+                                 |
+                                 v
+              +-------------------------------------------+
+              | Agent Hook / Bridge Layer                 |
+              |-------------------------------------------|
+              | - runtime plugin / hook                   |
+              | - attach workspace and native session ref |
+              | - send current turn to platform           |
+              | - receive platform-owned context          |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+              +-------------------------------------------+
+              | Context Platform Gateway                  |
+              |-------------------------------------------|
+              | - ingress for agent-originated requests   |
+              | - bind workspace / session / task / run   |
+              | - accept post-turn messages and events    |
+              | - return assembled context before turn    |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+              +-------------------------------------------+
+              | Context Platform Core                     |
+              |-------------------------------------------|
+              | - canonical Session / Task / Run          |
+              | - context assembly                        |
+              | - memory retrieval and consolidation      |
+              | - summaries / graph / pruning             |
+              | - artifacts / checkpoints / audit trail   |
+              +-------------------+-----------------------+
+                                  |
+                                  v
+                platform-owned context back into agent turn
+```
+
+这意味着 CLI 仍然是用户入口，但上下文控制面的主权在平台侧。
+
+### 2.2 目标形态下的 ownership split
+
+在这个目标形态下：
+
+- OpenCode 和 OpenClaw 继续拥有 native 模型执行和 native UX
+- 平台拥有 canonical `Session`、`Task`、`Run`、memory、上下文组装
+- hook / bridge 只是接入层，不是 canonical storage
+- runtime 自带的 `session / todo / history` 可以暂时作为 runtime-local mirror
+
 ## 3. 核心组件
 
 ### 3.1 `@ctx/client`

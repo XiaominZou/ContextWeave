@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Warm Benchmark Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Warm Benchmark Demo</p>
+          <h1>Only the latest real warm benchmark.</h1>
+          <p class="hero-text">
+            This page focuses on one thing: how a real continuation task behaves when the agent resumes work with and without the context platform.
+            You can see the round task, the injected session context, each LLM send, the tools that followed, and where the token gap actually comes from.
+          </p>
+        </div>
+        <div class="hero-side" id="hero-status"></div>
+      </header>
+
+      <main>
+        <section class="section warm-section">
+          <div class="section-heading">
+            <p class="section-kicker">Core Playback</p>
+            <h2>Replay one real continuation session from saved context to token cost.</h2>
+            <p class="section-text">
+              This page keeps only the essential story: a compact result strip and one stacked session playback built from the real warm benchmark trace.
+            </p>
+          </div>
+          <div class="warm-summary" id="warm-summary"></div>
+          <div class="warm-missions" id="warm-missions"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./demo-data.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
