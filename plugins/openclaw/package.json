@@ -1,5 +1,5 @@
 {
-  "name": "ctx-platform-openclaw-plugin",
+  "name": "ctx-platform-openclaw",
   "version": "0.1.0",
   "private": true,
   "type": "module",

@@ -17,6 +17,10 @@
     "usePlatformCompaction": {
       "label": "Platform Compaction",
       "help": "Enable only when the daemon implements compaction; otherwise OpenClaw runtime compaction is used."
+    },
+    "contextMode": {
+      "label": "Context Mode",
+      "help": "Choose whether the platform injects context alongside native messages or replaces prior runtime context with a platform-built view."
     }
   },
   "configSchema": {
@@ -34,6 +38,10 @@
       },
       "usePlatformCompaction": {
         "type": "boolean"
+      },
+      "contextMode": {
+        "type": "string",
+        "enum": ["inject", "replace"]
       }
     }
   }

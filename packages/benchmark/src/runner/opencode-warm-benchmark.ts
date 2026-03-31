@@ -16,7 +16,6 @@ import {
   type Session,
   type Task,
 } from "@ctx/core";
-import { OpenCodeAdapter, OpenCodeHostAdapter } from "@ctx/adapter-opencode";
 import { InMemoryStore } from "@ctx/testing";
 import { renderSnapshotToPromptText } from "../../../adapter-opencode/src/context-render";
 import { CallRecorder } from "../harness/call-recorder";
@@ -31,6 +30,13 @@ import type {
   MetricSpread,
   ToolUseRecord,
 } from "../results/schema";
+import {
+  createOpenCodePlatformHost,
+  launchOpenCodeRun,
+  registerOpenCodeCliAdapter,
+  resolveOpenCodeExecution,
+  type OpenCodeTransport,
+} from "./opencode-runtime-launch";
 import { copyFixtureToTemp, prepareBaselineConfigOverlay } from "./opencode-run-env";
 import { collectEventsWithTimeout } from "./run-event-timeout";
 import { WARM_BENCHMARK_ROUNDS, type WarmBenchmarkRoundDefinition } from "./warm-round-defs";
@@ -219,7 +225,7 @@ export interface RunWarmBenchmarkInput {
   fixtureDir?: string;
   roundTimeoutMs?: number;
   rounds?: WarmBenchmarkRoundDefinition[];
-  transport?: "cli" | "host" | "mixed-host";
+  transport?: OpenCodeTransport;
   pass1TooCompleteThreshold?: number;
 }
 
@@ -266,7 +272,7 @@ async function runWarmBenchmarkIteration(
     fixtureDir: string;
     roundTimeoutMs: number;
     rounds: WarmBenchmarkRoundDefinition[];
-    transport: "cli" | "host" | "mixed-host";
+    transport: OpenCodeTransport;
     pass1TooCompleteThreshold: number;
   },
 ): Promise<WarmBenchmarkRunResult> {
@@ -274,26 +280,21 @@ async function runWarmBenchmarkIteration(
   const baselineOverlay = mode === "baseline" ? await prepareBaselineConfigOverlay() : undefined;
   const store = new InMemoryStore();
   const platform = createContextPlatform({ store });
-
-  platform.runtime.adapters.register(
-    new OpenCodeAdapter({
-      binaryPath: config.binaryPath,
-      binaryArgs: config.binaryArgs,
-      agent: config.agent,
-      cwd: fixtureCopy.dir,
-      env: baselineOverlay?.env,
-    }),
-  );
-  platform.runtime.adapters.register(
-    new OpenCodeHostAdapter({
-      binaryPath: config.binaryPath,
-      binaryArgs: config.binaryArgs,
-      agent: config.agent,
-      cwd: fixtureCopy.dir,
-      env: baselineOverlay?.env,
-      startupTimeoutMs: Math.min(config.roundTimeoutMs, 15_000),
-    }),
-  );
+  registerOpenCodeCliAdapter(platform, {
+    binaryPath: config.binaryPath,
+    binaryArgs: config.binaryArgs,
+    agent: config.agent,
+    cwd: fixtureCopy.dir,
+    env: baselineOverlay?.env,
+  });
+  const host = createOpenCodePlatformHost({
+    binaryPath: config.binaryPath,
+    binaryArgs: config.binaryArgs,
+    agent: config.agent,
+    cwd: fixtureCopy.dir,
+    env: baselineOverlay?.env,
+    startupTimeoutMs: Math.min(config.roundTimeoutMs, 15_000),
+  });
 
   try {
     await applyWarmSeedToFixture(fixtureCopy.dir);
@@ -322,7 +323,9 @@ async function runWarmBenchmarkIteration(
     });
 
     const pass2Result = await runWarmPass({
+      platform,
       client,
+      host,
       workspaceId,
       sessionId: session.id,
       taskId: task.id,
@@ -366,14 +369,16 @@ async function runWarmBenchmarkIteration(
 }
 
 async function runWarmPass(input: {
+  platform: ReturnType<typeof createContextPlatform>;
   client: ReturnType<ReturnType<typeof createContextPlatform>["client"]>;
+  host: ReturnType<typeof createOpenCodePlatformHost>;
   workspaceId: string;
   sessionId: string;
   taskId: string;
   mode: WarmBenchmarkMode;
   iteration: number;
   rounds: WarmBenchmarkRoundDefinition[];
-  transport: "cli" | "host" | "mixed-host";
+  transport: OpenCodeTransport;
   roundTimeoutMs: number;
   seedContext: WarmSeedContext;
 }): Promise<{ runResult: BenchmarkRunResult; trace: WarmPassTrace }> {
@@ -383,14 +388,17 @@ async function runWarmPass(input: {
   const roundTraces: WarmRoundTrace[] = [];
 
   for (const round of input.rounds) {
-    const adapterName = resolveBenchmarkAdapter(input.mode, input.transport);
+    const execution = resolveOpenCodeExecution({
+      transport: input.transport,
+      isBaseline: input.mode === "baseline",
+    });
     const capabilityPolicy = buildCapabilityPolicy(input.mode);
     const preview = await input.client.experimental?.context.preview({
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       taskId: input.taskId,
       policy: capabilityPolicy,
-      adapter: adapterName,
+      adapter: execution.previewAdapter,
       metadata: {
         prompt: buildRealRoundPrompt(round.prompt),
       },
@@ -404,15 +412,16 @@ async function runWarmPass(input: {
     }
 
     const recorder = new CallRecorder();
-    const handle = await input.client.runs.start({
+    const handle = await launchOpenCodeRun({
+      platform: input.platform,
+      client: input.client,
+      host: input.host,
+      selection: execution,
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       taskId: input.taskId,
-      adapter: adapterName,
       capabilityPolicy,
-      metadata: {
-        prompt: buildRealRoundPrompt(round.prompt),
-      },
+      prompt: buildRealRoundPrompt(round.prompt),
     });
 
     const roundEvents = await collectEventsWithTimeout(handle, {
@@ -1335,19 +1344,6 @@ function groupWarmRunsByMode(results: WarmBenchmarkRunResult[]): Record<string, 
     grouped[result.mode].push(result);
   }
   return grouped;
-}
-
-function resolveBenchmarkAdapter(
-  mode: WarmBenchmarkMode,
-  transport: "cli" | "host" | "mixed-host",
-): "opencode" | "opencode-host" {
-  if (transport === "cli") {
-    return "opencode";
-  }
-  if (transport === "host") {
-    return "opencode-host";
-  }
-  return mode === "baseline" ? "opencode" : "opencode-host";
 }
 
 function buildRealRoundPrompt(prompt: string): string {

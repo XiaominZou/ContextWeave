@@ -13,6 +13,7 @@ import { asSerializedError, mustFind, throwPlatformError } from "./errors";
 import { nextId } from "./ids";
 import { extractRunExperienceMemory } from "./memory-extraction";
 import { buildRunDerivedContext, RUN_SUMMARY_METADATA_KEY, TOOL_CALL_REFS_METADATA_KEY } from "./run-derived-context";
+import { applyRunNativeMirror } from "./run-native-mirror";
 import { buildRunGraphIndex, RUN_GRAPH_INDEX_METADATA_KEY } from "./session-graph";
 import { applyNativeTaskMirror, maybeBuildNativeTaskMirror } from "./task-native-mirror";
 
@@ -88,6 +89,176 @@ export function createRunHandle(
   };
 }
 
+export function ingestRunEvent(input: {
+  store: PlatformStore;
+  runId: string;
+  event: AgentEventEnvelope;
+  priorEvents?: AgentEventEnvelope[];
+  buffer?: AsyncEventBuffer<AgentEventEnvelope>;
+  memoryApi?: MemoryAPI;
+  policy: CapabilityPolicy;
+  capturedArtifactIds?: Set<string>;
+}): { appendedEvents: AgentEventEnvelope[]; run: Run; terminal: boolean; postProcess?: Promise<void> } {
+  assertValidEnvelope(input.event);
+
+  const priorEvents = input.priorEvents ?? input.store.listEvents(input.runId);
+  const capturedArtifactIds = input.capturedArtifactIds ?? new Set<string>();
+  const appendedEvents: AgentEventEnvelope[] = [];
+
+  appendRunEvent({
+    store: input.store,
+    buffer: input.buffer,
+    event: input.event,
+    appendedEvents,
+  });
+
+  let currentRun = mustFind(input.store.getRun(input.runId), "Run", input.runId);
+  const fullHistory = [...priorEvents, ...appendedEvents];
+  const artifactEvents = maybeCaptureArtifactsFromToolResult({
+    run: currentRun,
+    event: input.event,
+    priorEvents: fullHistory,
+    policy: input.policy,
+    store: input.store,
+    capturedArtifactIds,
+  });
+  for (const artifactEvent of artifactEvents) {
+    appendRunEvent({
+      store: input.store,
+      buffer: input.buffer,
+      event: artifactEvent,
+      appendedEvents,
+    });
+  }
+
+  const historyAfterAppend = [...priorEvents, ...appendedEvents];
+  maybeMirrorNativeTaskState({
+    store: input.store,
+    taskId: currentRun.taskId,
+    event: input.event,
+    priorEvents: historyAfterAppend,
+    policy: input.policy,
+  });
+
+  if (input.event.type === "run.started") {
+    const payload = input.event.payload as { externalRef?: string };
+    currentRun = input.store.saveRun({
+      ...applyRunNativeMirror(currentRun, input.event),
+      status: currentRun.status === "queued" ? "running" : currentRun.status,
+      startedAt: currentRun.startedAt ?? new Date().toISOString(),
+      externalRef: payload.externalRef ?? currentRun.externalRef,
+    });
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: false,
+    };
+  }
+
+  if (input.event.type === "run.usage") {
+    const payload = input.event.payload as { inputTokens?: number; outputTokens?: number };
+    currentRun = input.store.saveRun({
+      ...currentRun,
+      usage: {
+        inputTokens: (currentRun.usage?.inputTokens ?? 0) + (payload.inputTokens ?? 0),
+        outputTokens: (currentRun.usage?.outputTokens ?? 0) + (payload.outputTokens ?? 0),
+      },
+    });
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: false,
+    };
+  }
+
+  if (input.event.type === "message.delta" || input.event.type === "message.completed") {
+    currentRun = input.store.saveRun(applyRunNativeMirror(currentRun, input.event));
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: false,
+    };
+  }
+
+  const terminal = isTerminalEvent(input.event.type);
+  if (!terminal) {
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: false,
+    };
+  }
+
+  if (isTerminalStatus(currentRun.status)) {
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: true,
+    };
+  }
+
+  if (input.event.type === "run.completed") {
+    currentRun = input.store.saveRun({
+      ...currentRun,
+      status: "completed",
+      endedAt: new Date().toISOString(),
+    });
+    void persistRunDerivedContext({
+      store: input.store,
+      run: currentRun,
+      events: historyAfterAppend,
+    });
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: true,
+      postProcess: maybeExtractExperienceMemory({
+        run: currentRun,
+        terminalEvent: input.event,
+        store: input.store,
+        buffer: input.buffer,
+        memoryApi: input.memoryApi,
+        policy: input.policy,
+      }),
+    };
+  }
+
+  if (input.event.type === "run.failed") {
+    currentRun = input.store.saveRun({
+      ...currentRun,
+      status: "failed",
+      endedAt: new Date().toISOString(),
+      error: (input.event.payload as { error: Run["error"] }).error ?? undefined,
+    });
+    void persistRunDerivedContext({
+      store: input.store,
+      run: currentRun,
+      events: historyAfterAppend,
+    });
+    return {
+      appendedEvents,
+      run: currentRun,
+      terminal: true,
+    };
+  }
+
+  currentRun = input.store.saveRun({
+    ...currentRun,
+    status: "cancelled",
+    endedAt: new Date().toISOString(),
+  });
+  void persistRunDerivedContext({
+    store: input.store,
+    run: currentRun,
+    events: historyAfterAppend,
+  });
+  return {
+    appendedEvents,
+    run: currentRun,
+    terminal: true,
+  };
+}
+
 export async function processRunStream(input: {
   store: PlatformStore;
   adapter: AgentAdapter;
@@ -108,108 +279,21 @@ export async function processRunStream(input: {
       if (!envelope) {
         continue;
       }
-
-      assertValidEnvelope(envelope);
-      collectedEvents.push(envelope);
-      input.store.appendEvent(envelope);
-      input.buffer.push(envelope);
-
-      const currentRun = mustFind(input.store.getRun(input.runId), "Run", input.runId);
-      const artifactEvents = maybeCaptureArtifactsFromToolResult({
-        run: currentRun,
+      const result = ingestRunEvent({
+        store: input.store,
+        runId: input.runId,
         event: envelope,
         priorEvents: collectedEvents,
+        buffer: input.buffer,
+        memoryApi: input.memoryApi,
         policy: input.policy,
-        store: input.store,
         capturedArtifactIds,
       });
-      for (const artifactEvent of artifactEvents) {
-        collectedEvents.push(artifactEvent);
-        input.store.appendEvent(artifactEvent);
-        input.buffer.push(artifactEvent);
+      collectedEvents.push(...result.appendedEvents);
+      sawTerminalEvent = sawTerminalEvent || result.terminal;
+      if (result.postProcess) {
+        await result.postProcess;
       }
-
-      maybeMirrorNativeTaskState({
-        store: input.store,
-        taskId: currentRun.taskId,
-        event: envelope,
-        priorEvents: collectedEvents,
-        policy: input.policy,
-      });
-
-      if (envelope.type === "run.started") {
-        const externalRef = (envelope.payload as { externalRef?: string }).externalRef;
-        if (externalRef && currentRun.externalRef !== externalRef) {
-          input.store.saveRun({ ...currentRun, externalRef });
-        }
-        continue;
-      }
-
-      if (envelope.type === "run.usage") {
-        const payload = envelope.payload as { inputTokens?: number; outputTokens?: number };
-        input.store.saveRun({
-          ...currentRun,
-          usage: {
-            inputTokens: (currentRun.usage?.inputTokens ?? 0) + (payload.inputTokens ?? 0),
-            outputTokens: (currentRun.usage?.outputTokens ?? 0) + (payload.outputTokens ?? 0),
-          },
-        });
-        continue;
-      }
-
-      if (!isTerminalEvent(envelope.type)) {
-        continue;
-      }
-
-      sawTerminalEvent = true;
-
-      if (isTerminalStatus(currentRun.status)) {
-        continue;
-      }
-
-      if (envelope.type === "run.completed") {
-        const completedRun = input.store.saveRun({
-          ...currentRun,
-          status: "completed",
-          endedAt: new Date().toISOString(),
-        });
-        void persistRunDerivedContext({
-          store: input.store,
-          run: completedRun,
-          events: collectedEvents,
-        });
-        await maybeExtractExperienceMemory({
-          run: completedRun,
-          terminalEvent: envelope,
-          store: input.store,
-          buffer: input.buffer,
-          memoryApi: input.memoryApi,
-          policy: input.policy,
-        });
-        continue;
-      }
-
-      if (envelope.type === "run.failed") {
-        const failedRun = input.store.saveRun({
-          ...currentRun,
-          status: "failed",
-          endedAt: new Date().toISOString(),
-          error: (envelope.payload as { error: Run["error"] }).error ?? undefined,
-        });
-        void persistRunDerivedContext({
-          store: input.store,
-          run: failedRun,
-          events: collectedEvents,
-        });
-        continue;
-      }
-
-      const cancelledRun = input.store.saveRun({ ...currentRun, status: "cancelled", endedAt: new Date().toISOString() });
-      void persistRunDerivedContext({
-        store: input.store,
-        run: cancelledRun,
-        events: collectedEvents,
-      });
     }
 
     if (!sawTerminalEvent) {
@@ -260,11 +344,22 @@ export async function processRunStream(input: {
   }
 }
 
+function appendRunEvent(input: {
+  store: PlatformStore;
+  buffer?: AsyncEventBuffer<AgentEventEnvelope>;
+  event: AgentEventEnvelope;
+  appendedEvents: AgentEventEnvelope[];
+}): void {
+  input.appendedEvents.push(input.event);
+  input.store.appendEvent(input.event);
+  input.buffer?.push(input.event);
+}
+
 async function maybeExtractExperienceMemory(input: {
   run: Run;
   terminalEvent: AgentEventEnvelope;
   store: PlatformStore;
-  buffer: AsyncEventBuffer<AgentEventEnvelope>;
+  buffer?: AsyncEventBuffer<AgentEventEnvelope>;
   memoryApi?: MemoryAPI;
   policy: CapabilityPolicy;
 }): Promise<void> {
@@ -299,7 +394,7 @@ async function maybeExtractExperienceMemory(input: {
     };
 
     input.store.appendEvent(extractionEvent);
-    input.buffer.push(extractionEvent);
+    input.buffer?.push(extractionEvent);
   } catch {
     // Extraction failures must not affect the terminal run state in V1.1.
   }

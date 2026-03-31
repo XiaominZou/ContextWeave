@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-import { homedir } from "node:os";
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { getOpenClawProjectStateDir, getOpenClawProjectWorkspaceDir } from "./openclaw-project-paths.mjs";
 
-const stateHome = process.env.OPENCLAW_STATE_DIR || path.join(homedir(), ".openclaw");
+const stateHome = getOpenClawProjectStateDir();
 const configPath = path.join(stateHome, "openclaw.json");
 const pluginRoot = path.resolve(process.argv[2] || "plugins/openclaw");
 const pluginId = "ctx-platform-openclaw";
 const engineId = process.env.CTX_OPENCLAW_PLATFORM_ENGINE_ID || "ctx-platform";
 const daemonUrl = process.env.CTX_OPENCLAW_PLATFORM_DAEMON_URL || "http://127.0.0.1:4318";
+const contextMode = process.env.CTX_OPENCLAW_PLATFORM_CONTEXT_MODE === "replace" ? "replace" : "inject";
+const workspaceDir = getOpenClawProjectWorkspaceDir();
 
 await mkdir(stateHome, { recursive: true });
 const existing = await loadConfig(configPath);
@@ -29,15 +31,23 @@ existing.plugins.entries[pluginId] = {
     ...(isRecord(existing.plugins.entries[pluginId]?.config) ? existing.plugins.entries[pluginId].config : {}),
     daemonUrl,
     engineId,
+    contextMode,
+    workspaceDir,
   },
 };
 existing.plugins.slots.contextEngine = engineId;
+existing.agents = isRecord(existing.agents) ? existing.agents : {};
+existing.agents.defaults = isRecord(existing.agents.defaults) ? existing.agents.defaults : {};
+existing.agents.defaults.workspace = workspaceDir;
 
 await writeFile(configPath, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
 process.stdout.write(`[ctx-openclaw-install] plugin path registered in ${configPath}\n`);
+process.stdout.write(`[ctx-openclaw-install] project state dir: ${stateHome}\n`);
 process.stdout.write(`[ctx-openclaw-install] plugin root: ${pluginRoot}\n`);
 process.stdout.write(`[ctx-openclaw-install] context engine slot: ${engineId}\n`);
 process.stdout.write(`[ctx-openclaw-install] daemon url: ${daemonUrl}\n`);
+process.stdout.write(`[ctx-openclaw-install] context mode: ${contextMode}\n`);
+process.stdout.write(`[ctx-openclaw-install] workspace dir: ${workspaceDir}\n`);
 
 async function loadConfig(filePath) {
   try {

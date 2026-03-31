@@ -1,13 +1,13 @@
 import path from "node:path";
 
 import { delegateCompactionToRuntime } from "openclaw/plugin-sdk/core";
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:4318";
 const DEFAULT_PLUGIN_ID = "ctx-platform-openclaw";
 const DEFAULT_ENGINE_ID = "ctx-platform";
+const DEFAULT_CONTEXT_MODE = "inject";
 
-export default definePluginEntry({
+export default {
   id: DEFAULT_PLUGIN_ID,
   name: "Context Platform OpenClaw",
   description: "Use the Context Platform as OpenClaw's native context engine.",
@@ -18,6 +18,9 @@ export default definePluginEntry({
     const engineId = trimString(pluginConfig.engineId) || process.env.CTX_OPENCLAW_PLATFORM_ENGINE_ID || DEFAULT_ENGINE_ID;
     const workspaceDir = trimString(pluginConfig.workspaceDir) || process.cwd();
     const usePlatformCompaction = Boolean(pluginConfig.usePlatformCompaction);
+    const contextMode = normalizeContextMode(pluginConfig.contextMode)
+      || normalizeContextMode(process.env.CTX_OPENCLAW_PLATFORM_CONTEXT_MODE)
+      || DEFAULT_CONTEXT_MODE;
 
     api.registerContextEngine(engineId, () => ({
       info: {
@@ -30,18 +33,21 @@ export default definePluginEntry({
         return await postJson(daemonUrl, "/v1/openclaw/context-engine/bootstrap", {
           ...params,
           workspaceDir,
+          contextMode,
         });
       },
       async ingest(params) {
         return await postJson(daemonUrl, "/v1/openclaw/context-engine/ingest", {
           ...params,
           workspaceDir,
+          contextMode,
         });
       },
       async assemble(params) {
         const result = await postJson(daemonUrl, "/v1/openclaw/context-engine/assemble", {
           ...params,
           workspaceDir,
+          contextMode,
         });
         return {
           messages: Array.isArray(result.messages) ? result.messages : params.messages,
@@ -56,17 +62,19 @@ export default definePluginEntry({
         return await postJson(daemonUrl, "/v1/openclaw/context-engine/compact", {
           ...params,
           workspaceDir,
+          contextMode,
         });
       },
       async afterTurn(params) {
         await postJson(daemonUrl, "/v1/openclaw/context-engine/after-turn", {
           ...params,
           workspaceDir,
+          contextMode,
         });
       },
     }));
   },
-});
+};
 
 async function postJson(baseUrl, route, payload) {
   const response = await fetch(new URL(route, ensureTrailingSlash(baseUrl)), {
@@ -91,6 +99,10 @@ function ensureTrailingSlash(url) {
 
 function trimString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeContextMode(value) {
+  return value === "inject" || value === "replace" ? value : undefined;
 }
 
 function isRecord(value) {

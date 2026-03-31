@@ -5,6 +5,7 @@ export * from "./results/analyzer";
 export * from "./results/completion-score";
 export * from "./results/reporter";
 export * from "./results/schema";
+export * from "./pinchbench/openclaw-pinchbench";
 export * from "./runner/benchmark-runner";
 export * from "./runner/opencode-real-benchmark";
 export * from "./runner/opencode-real-probe";

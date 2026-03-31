@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
 import { createContextPlatform } from "@ctx/client";
 import { defaultCapabilityPolicy, type CapabilityPolicy, type ContextSnapshot } from "@ctx/core";
-import { OpenCodeAdapter, OpenCodeHostAdapter } from "@ctx/adapter-opencode";
 import { createInMemoryMemorySubsystem, InMemoryStore } from "@ctx/testing";
 import { renderSnapshotToPromptText } from "../../../adapter-opencode/src/context-render";
 import { CallRecorder } from "../harness/call-recorder";
@@ -11,6 +10,13 @@ import { analyzeBenchmarkResults } from "../results/analyzer";
 import { scoreCompletionForFixture } from "../results/completion-score";
 import type { BenchmarkAnalysis, BenchmarkMode, BenchmarkRoundDiagnostics, BenchmarkRunResult } from "../results/schema";
 import { BENCHMARK_ROUNDS, type BenchmarkRoundDefinition } from "./round-defs";
+import {
+  createOpenCodePlatformHost,
+  launchOpenCodeRun,
+  registerOpenCodeCliAdapter,
+  resolveOpenCodeExecution,
+  type OpenCodeTransport,
+} from "./opencode-runtime-launch";
 import { copyFixtureToTemp, prepareBaselineConfigOverlay } from "./opencode-run-env";
 import { collectEventsWithTimeout } from "./run-event-timeout";
 
@@ -27,7 +33,7 @@ export interface RunRealBenchmarkInput {
   roundLimit?: number;
   roundTimeoutMs?: number;
   rounds?: BenchmarkRoundDefinition[];
-  transport?: "cli" | "host" | "mixed-host";
+  transport?: OpenCodeTransport;
 }
 
 export interface RunRealBenchmarkOutput {
@@ -74,7 +80,7 @@ async function runRealBenchmarkIteration(
     roundLimit?: number;
     roundTimeoutMs: number;
     rounds?: BenchmarkRoundDefinition[];
-    transport: "cli" | "host" | "mixed-host";
+    transport: OpenCodeTransport;
   },
 ): Promise<BenchmarkRunResult> {
   const fixtureCopy = await copyFixtureToTemp(config.fixtureDir);
@@ -82,26 +88,21 @@ async function runRealBenchmarkIteration(
   const memorySubsystem = mode === "platform-context-memory-real" ? createInMemoryMemorySubsystem() : undefined;
   const store = new InMemoryStore();
   const platform = createContextPlatform({ store, memory: memorySubsystem });
-
-  platform.runtime.adapters.register(
-    new OpenCodeAdapter({
-      binaryPath: config.binaryPath,
-      binaryArgs: config.binaryArgs,
-      agent: config.agent,
-      cwd: fixtureCopy.dir,
-      env: baselineOverlay?.env,
-    }),
-  );
-  platform.runtime.adapters.register(
-    new OpenCodeHostAdapter({
-      binaryPath: config.binaryPath,
-      binaryArgs: config.binaryArgs,
-      agent: config.agent,
-      cwd: fixtureCopy.dir,
-      env: baselineOverlay?.env,
-      startupTimeoutMs: Math.min(config.roundTimeoutMs, 15_000),
-    }),
-  );
+  registerOpenCodeCliAdapter(platform, {
+    binaryPath: config.binaryPath,
+    binaryArgs: config.binaryArgs,
+    agent: config.agent,
+    cwd: fixtureCopy.dir,
+    env: baselineOverlay?.env,
+  });
+  const host = createOpenCodePlatformHost({
+    binaryPath: config.binaryPath,
+    binaryArgs: config.binaryArgs,
+    agent: config.agent,
+    cwd: fixtureCopy.dir,
+    env: baselineOverlay?.env,
+    startupTimeoutMs: Math.min(config.roundTimeoutMs, 15_000),
+  });
 
   try {
     const client = platform.client();
@@ -123,7 +124,10 @@ async function runRealBenchmarkIteration(
     const roundDiagnostics: BenchmarkRoundDiagnostics[] = [];
 
     for (const round of rounds) {
-      const adapterName = resolveBenchmarkAdapter(mode, config.transport);
+      const execution = resolveOpenCodeExecution({
+        transport: config.transport,
+        isBaseline: mode === "baseline",
+      });
       const isEarlyRound = round.round <= 2;
       const basePolicy: CapabilityPolicy =
         mode === "baseline"
@@ -146,7 +150,7 @@ async function runRealBenchmarkIteration(
         sessionId: session.id,
         taskId: task.id,
         policy: capabilityPolicy,
-        adapter: adapterName,
+        adapter: execution.previewAdapter,
         metadata: {
           prompt: buildRealRoundPrompt(round.prompt),
         },
@@ -158,15 +162,16 @@ async function runRealBenchmarkIteration(
           snapshot: preview.snapshot,
         }));
       }
-      const handle = await client.runs.start({
+      const handle = await launchOpenCodeRun({
+        platform,
+        client,
+        host,
+        selection: execution,
         workspaceId,
         sessionId: session.id,
         taskId: task.id,
-        adapter: adapterName,
         capabilityPolicy,
-        metadata: {
-          prompt: buildRealRoundPrompt(round.prompt),
-        },
+        prompt: buildRealRoundPrompt(round.prompt),
       });
 
       await collectEventsWithTimeout(handle, {
@@ -239,19 +244,6 @@ function buildRoundDiagnostics(input: {
     sourceTypeCounts,
     retentionCounts,
   };
-}
-
-function resolveBenchmarkAdapter(
-  mode: Extract<BenchmarkMode, "baseline" | "platform-context" | "platform-context-memory-real">,
-  transport: "cli" | "host" | "mixed-host",
-): "opencode" | "opencode-host" {
-  if (transport === "cli") {
-    return "opencode";
-  }
-  if (transport === "host") {
-    return "opencode-host";
-  }
-  return mode === "baseline" ? "opencode" : "opencode-host";
 }
 
 function buildRealRoundPrompt(prompt: string): string {

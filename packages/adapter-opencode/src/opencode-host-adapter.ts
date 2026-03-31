@@ -3,17 +3,37 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import type { AgentEventEnvelope } from "@ctx/core";
 import type {
-  AdapterCapabilities,
-  AdapterPayload,
   AdapterRunHandle,
   AdapterRunInput,
-  AgentAdapter,
   CliAdapterPayload,
+  McpServerConfig,
   RenderContextInput,
-  ResumeRunInput,
 } from "@ctx/adapter-kit";
+import { buildPlatformMemoryMcpServers, buildPlatformTaskMcpServers } from "@ctx/adapter-kit";
 import { renderSnapshotToPromptText } from "./context-render";
 
+export const OPENCODE_HOST_RUNTIME_NAME = "opencode-host";
+export const OPENCODE_HOST_RUNTIME_VERSION = "0.1.0";
+export const OPENCODE_HOST_RUNTIME_CAPABILITIES = {
+  invocationMode: "cli-process",
+  streaming: true,
+  toolCalls: true,
+  checkpoints: false,
+  resume: false,
+  interrupt: true,
+  nativeMcp: true,
+  capabilitySupport: {
+    context: "intercept",
+    memory: "intercept",
+    tasks: "intercept",
+    artifacts: "observe-only",
+  },
+} as const;
+
+/**
+ * @deprecated Prefer OpenCodePlatformHost for the supported `opencode -> platform.runtime.bridge` path.
+ * This options shape remains as a compatibility layer for the host-backed runtime implementation.
+ */
 export interface OpenCodeHostAdapterOptions {
   binaryPath?: string;
   binaryArgs?: string[];
@@ -34,9 +54,7 @@ interface WrappedRawEvent {
 }
 
 interface OpenCodePromptResponse {
-  info?: {
-    finish?: string;
-  };
+  info?: Record<string, unknown>;
   parts?: unknown[];
 }
 
@@ -55,6 +73,14 @@ interface OpenCodeSessionStatus {
 interface OpenCodePermissionRequest {
   id?: string;
   sessionID?: string;
+}
+
+interface OpenCodeHostStreamState {
+  usageEmitted: boolean;
+  emittedToolCalls: Set<string>;
+  emittedToolResults: Set<string>;
+  emittedTextLength: number;
+  completed: boolean;
 }
 
 class AsyncQueue<T> {
@@ -98,94 +124,99 @@ class AsyncQueue<T> {
   }
 }
 
-export class OpenCodeHostAdapter implements AgentAdapter {
-  readonly name = "opencode-host";
-  readonly version = "0.1.0";
-  readonly invocationMode = "cli-process" as const;
+export function renderOpenCodeHostPayload(
+  options: OpenCodeHostAdapterOptions,
+  input: RenderContextInput,
+): CliAdapterPayload {
+  return {
+    mode: "cli-process",
+    argv: [],
+    env: { ...options.env },
+    configFileInjection: input.policy.context === "native" ? undefined : renderSnapshotToPromptText(input.snapshot),
+    mcpServers: [
+      ...(input.policy.memory === "tool-bridge" ? (input.toolBridge?.memoryMcpServers ?? buildPlatformMemoryMcpServers(input.run)) : []),
+      ...(input.policy.tasks === "platform-tools" ? (input.toolBridge?.taskMcpServers ?? buildPlatformTaskMcpServers(input.run)) : []),
+    ],
+  } satisfies CliAdapterPayload;
+}
 
-  readonly capabilities: AdapterCapabilities = {
-    invocationMode: "cli-process",
-    streaming: false,
-    toolCalls: true,
-    checkpoints: false,
-    resume: false,
-    interrupt: true,
-    nativeMcp: false,
-    capabilitySupport: {
-      context: "intercept",
-      memory: "intercept",
-      tasks: "observe-only",
-      artifacts: "observe-only",
-    },
-  };
-
-  constructor(private readonly options: OpenCodeHostAdapterOptions = {}) {}
-
-  async renderContext(input: RenderContextInput): Promise<AdapterPayload> {
-    return {
-      mode: "cli-process",
-      argv: [],
-      env: { ...this.options.env },
-      configFileInjection: input.policy.context === "native" ? undefined : renderSnapshotToPromptText(input.snapshot),
-    } satisfies CliAdapterPayload;
+export async function createOpenCodeHostRun(
+  options: OpenCodeHostAdapterOptions,
+  input: AdapterRunInput,
+): Promise<AdapterRunHandle> {
+  if (input.payload.mode !== "cli-process") {
+    throw new Error("OpenCodeHostAdapter requires cli-process payload");
   }
 
-  async createRun(input: AdapterRunInput): Promise<AdapterRunHandle> {
-    if (input.payload.mode !== "cli-process") {
-      throw new Error("OpenCodeHostAdapter requires cli-process payload");
-    }
+  const payload = input.payload;
+  const queue = new AsyncQueue<WrappedRawEvent>();
+  const controller = new AbortController();
+  const command = resolveCommand(options.binaryPath);
+  const cwd = options.cwd ?? process.cwd();
+  const port = await getAvailablePort();
+  const args = [...(options.binaryArgs ?? []), 'serve', `--hostname=127.0.0.1`, `--port=${port}`];
+  debug('spawn-host', { command, args, cwd });
 
-    const payload = input.payload;
-    const queue = new AsyncQueue<WrappedRawEvent>();
-    const controller = new AbortController();
-    const command = resolveCommand(this.options.binaryPath);
-    const cwd = this.options.cwd ?? process.cwd();
-    const port = await getAvailablePort();
-    const args = [...(this.options.binaryArgs ?? []), 'serve', `--hostname=127.0.0.1`, `--port=${port}`];
-    debug('spawn-host', { command, args, cwd });
+  const child = spawnCommand(command, args, {
+    cwd,
+    env: {
+      ...process.env,
+      ...payload.env,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  child.stdin.end();
 
-    const child = spawnCommand(command, args, {
-      cwd,
-      env: {
-        ...process.env,
-        ...input.payload.env,
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    child.stdin.end();
+  const context = {
+    workspaceId: input.run.workspaceId,
+    sessionId: input.run.sessionId,
+    taskId: input.run.taskId,
+    runId: input.run.id,
+  };
 
-    const context = {
-      workspaceId: input.run.workspaceId,
-      sessionId: input.run.sessionId,
-      taskId: input.run.taskId,
-      runId: input.run.id,
-    };
+  const lifecycle = (async () => {
+    try {
+      const baseUrl = await waitForServerUrl(child, port, options.startupTimeoutMs ?? 15000);
+      const session = await postJson<{ id: string }>(`${baseUrl}/session?directory=${encodeURIComponent(cwd)}`, {
+        title: input.run.id,
+      }, controller.signal);
+      debug('created-session', { sessionId: session.id, cwd });
 
-    const lifecycle = (async () => {
-      try {
-        const baseUrl = await waitForServerUrl(child, port, this.options.startupTimeoutMs ?? 15000);
-        const session = await postJson<{ id: string }>(`${baseUrl}/session?directory=${encodeURIComponent(cwd)}`, {
-          title: input.run.id,
-        }, controller.signal);
-        debug('created-session', { sessionId: session.id, cwd });
+      await registerMcpServers({
+        baseUrl,
+        cwd,
+        signal: controller.signal,
+        mcpServers: payload.mcpServers,
+      });
 
-        queue.push({
-          context,
-          event: {
-            type: 'run.started',
-            sessionID: session.id,
-            model: input.run.model,
-          },
-        });
+      queue.push({
+        context,
+        event: {
+          type: 'run.started',
+          sessionID: session.id,
+          model: input.run.model,
+        },
+      });
 
-        const promptBody = {
-          ...(payload.configFileInjection ? { system: payload.configFileInjection } : {}),
-          parts: [{ type: 'text', text: userPrompt(input.run) }],
-          ...(input.run.model ? { model: input.run.model } : {}),
-          ...(this.options.agent ? { agent: this.options.agent } : {}),
-          noReply: false,
-        };
+      const promptBody = {
+        ...(payload.configFileInjection ? { system: payload.configFileInjection } : {}),
+        parts: [{ type: 'text', text: userPrompt(input.run) }],
+        ...(input.run.model ? { model: input.run.model } : {}),
+        ...(options.agent ? { agent: options.agent } : {}),
+        noReply: false,
+      };
 
+      const streamed = await tryStreamPromptResponse({
+        baseUrl,
+        cwd,
+        sessionId: session.id,
+        signal: controller.signal,
+        promptBody,
+        queue,
+        context,
+        timeoutMs: 90_000,
+      });
+      if (!streamed) {
         const promptResponse = await postMaybeJson<OpenCodePromptResponse>(
           `${baseUrl}/session/${session.id}/message`,
           promptBody,
@@ -199,171 +230,180 @@ export class OpenCodeHostAdapter implements AgentAdapter {
           });
           emitPromptResponse(queue, context, promptResponse);
         }
-        else {
-          debug('prompt-response-empty', { sessionId: session.id });
-          await postWithoutReadingBody(
-            `${baseUrl}/session/${session.id}/prompt_async`,
-            promptBody,
-            controller.signal,
-          );
-          const completed = await pollCompletedAssistantMessage({
-            baseUrl,
-            cwd,
-            sessionId: session.id,
-            signal: controller.signal,
-            timeoutMs: 90_000,
-          });
-          emitPromptResponse(queue, context, completed);
-        }
-      } catch (error) {
-        queue.push({
-          context,
-          event: {
-            type: 'error',
-            code: 'OPENCODE_HOST_ERROR',
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
-      } finally {
-        controller.abort();
-        child.kill();
-        queue.close();
       }
-    })();
+    } catch (error) {
+      queue.push({
+        context,
+        event: {
+          type: 'error',
+          code: 'OPENCODE_HOST_ERROR',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    } finally {
+      controller.abort();
+      child.kill();
+      queue.close();
+    }
+  })();
 
-    void lifecycle;
+  void lifecycle;
 
-    return {
-      streamEvents() {
-        return queue.stream();
-      },
-      cancel: async () => {
-        controller.abort();
-        child.kill();
-      },
-    };
+  return {
+    streamEvents() {
+      return queue.stream();
+    },
+    cancel: async () => {
+      controller.abort();
+      child.kill();
+    },
+  };
+}
+
+export function normalizeOpenCodeHostEvent(rawEvent: unknown): AgentEventEnvelope | null {
+  const wrapped = unwrapRawEvent(rawEvent);
+  const event = wrapped?.event ?? rawEvent;
+  const context = wrapped?.context ?? {
+    workspaceId: 'ws_contract',
+    sessionId: 'sess_contract',
+    taskId: 'task_contract',
+    runId: 'run_contract',
+  };
+
+  const base = {
+    id: `evt_${Math.random().toString(36).slice(2, 10)}`,
+    workspaceId: context.workspaceId,
+    sessionId: context.sessionId,
+    taskId: context.taskId,
+    runId: context.runId,
+    adapter: OPENCODE_HOST_RUNTIME_NAME,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (!isRecord(event)) {
+    return null;
   }
 
-  normalizeEvent(rawEvent: unknown): AgentEventEnvelope | null {
-    const wrapped = unwrapRawEvent(rawEvent);
-    const event = wrapped?.event ?? rawEvent;
-    const context = wrapped?.context ?? {
-      workspaceId: 'ws_contract',
-      sessionId: 'sess_contract',
-      taskId: 'task_contract',
-      runId: 'run_contract',
-    };
-
-    const base = {
-      id: `evt_${Math.random().toString(36).slice(2, 10)}`,
-      workspaceId: context.workspaceId,
-      sessionId: context.sessionId,
-      taskId: context.taskId,
-      runId: context.runId,
-      adapter: this.name,
-      timestamp: new Date().toISOString(),
-    };
-
-    if (!isRecord(event)) {
+  const type = readString(event.type);
+  switch (type) {
+    case 'run.started':
+    case 'run_started':
+    case 'session.started':
+      return {
+        ...base,
+        type: 'run.started',
+        payload: {
+          model: readString(event.model),
+          externalRef: readString(event.sessionID) ?? readString(event.sessionId),
+        },
+      };
+    case 'text':
+    case 'message.delta':
+      return {
+        ...base,
+        type: 'message.delta',
+        payload: {
+          role: 'assistant',
+          text: readString(event.text) ?? readNestedString(event.part, 'text') ?? '',
+        },
+      };
+    case 'tool.call':
+    case 'tool_call':
+    case 'tool_use':
+      return {
+        ...base,
+        type: 'tool.call',
+        payload: {
+          callId: readString(event.callID) ?? readString(event.callId) ?? readString(event.id) ?? 'call_unknown',
+          name: readString(event.name) ?? readString(event.tool) ?? readNestedString(event.part, 'tool') ?? readNestedString(event.part, 'name') ?? 'unknown_tool',
+          input: event.input ?? readNestedValue(event.part, 'input') ?? readNestedValue(readNestedValue(event.part, 'state'), 'input') ?? {},
+        },
+      };
+    case 'tool.result':
+    case 'tool_result':
+      return {
+        ...base,
+        type: 'tool.result',
+        payload: {
+          callId: readString(event.callID) ?? readString(event.callId) ?? 'call_unknown',
+          output: event.output ?? readNestedValue(event.part, 'output') ?? null,
+          isError: readBoolean(event.isError) ?? false,
+        },
+      };
+    case 'usage':
+    case 'run.usage':
+      return {
+        ...base,
+        type: 'run.usage',
+        payload: {
+          inputTokens:
+            readNumber(event.inputTokens) ??
+            readNumber(event.input_tokens) ??
+            readNestedNumber(event.usage, 'inputTokens') ??
+            readNestedNumber(event.usage, 'input_tokens'),
+          outputTokens:
+            readNumber(event.outputTokens) ??
+            readNumber(event.output_tokens) ??
+            readNestedNumber(event.usage, 'outputTokens') ??
+            readNestedNumber(event.usage, 'output_tokens'),
+          cacheReadInputTokens: readUsageCacheReadTokens(event),
+          cacheWriteInputTokens: readUsageCacheWriteTokens(event),
+        },
+      };
+    case 'run.completed':
+    case 'run_completed':
+    case 'message_stop':
+      return {
+        ...base,
+        type: 'run.completed',
+        payload: {
+          reason: readString(event.reason) ?? readString(event.stop_reason),
+        },
+      };
+    case 'error':
+    case 'run.failed':
+      return {
+        ...base,
+        type: 'run.failed',
+        payload: {
+          error: {
+            code: readString(event.code) ?? 'OPENCODE_HOST_ERROR',
+            message: readString(event.message) ?? 'OpenCode host error',
+          },
+        },
+      };
+    default:
       return null;
-    }
+  }
+}
 
-    const type = readString(event.type);
-    switch (type) {
-      case 'run.started':
-      case 'run_started':
-      case 'session.started':
-        return {
-          ...base,
-          type: 'run.started',
-          payload: {
-            model: readString(event.model),
-            externalRef: readString(event.sessionID) ?? readString(event.sessionId),
-          },
-        };
-      case 'text':
-      case 'message.delta':
-        return {
-          ...base,
-          type: 'message.delta',
-          payload: {
-            role: 'assistant',
-            text: readString(event.text) ?? readNestedString(event.part, 'text') ?? '',
-          },
-        };
-      case 'tool.call':
-      case 'tool_call':
-      case 'tool_use':
-        return {
-          ...base,
-          type: 'tool.call',
-          payload: {
-            callId: readString(event.callID) ?? readString(event.callId) ?? readString(event.id) ?? 'call_unknown',
-            name: readString(event.name) ?? readString(event.tool) ?? readNestedString(event.part, 'tool') ?? readNestedString(event.part, 'name') ?? 'unknown_tool',
-            input: event.input ?? readNestedValue(event.part, 'input') ?? readNestedValue(readNestedValue(event.part, 'state'), 'input') ?? {},
-          },
-        };
-      case 'tool.result':
-      case 'tool_result':
-        return {
-          ...base,
-          type: 'tool.result',
-          payload: {
-            callId: readString(event.callID) ?? readString(event.callId) ?? 'call_unknown',
-            output: event.output ?? readNestedValue(event.part, 'output') ?? null,
-            isError: readBoolean(event.isError) ?? false,
-          },
-        };
-      case 'usage':
-      case 'run.usage':
-        return {
-          ...base,
-          type: 'run.usage',
-          payload: {
-            inputTokens:
-              readNumber(event.inputTokens) ??
-              readNumber(event.input_tokens) ??
-              readNestedNumber(event.usage, 'inputTokens') ??
-              readNestedNumber(event.usage, 'input_tokens'),
-            outputTokens:
-              readNumber(event.outputTokens) ??
-              readNumber(event.output_tokens) ??
-              readNestedNumber(event.usage, 'outputTokens') ??
-              readNestedNumber(event.usage, 'output_tokens'),
-            cacheReadInputTokens: readUsageCacheReadTokens(event),
-            cacheWriteInputTokens: readUsageCacheWriteTokens(event),
-          },
-        };
-      case 'run.completed':
-      case 'run_completed':
-      case 'message_stop':
-        return {
-          ...base,
-          type: 'run.completed',
-          payload: {
-            reason: readString(event.reason) ?? readString(event.stop_reason),
-          },
-        };
-      case 'error':
-      case 'run.failed':
-        return {
-          ...base,
-          type: 'run.failed',
-          payload: {
-            error: {
-              code: readString(event.code) ?? 'OPENCODE_HOST_ERROR',
-              message: readString(event.message) ?? 'OpenCode host error',
-            },
-          },
-        };
-      default:
-        return null;
+async function tryStreamPromptResponse(input: {
+  baseUrl: string;
+  cwd: string;
+  sessionId: string;
+  signal: AbortSignal;
+  promptBody: Record<string, unknown>;
+  queue: AsyncQueue<WrappedRawEvent>;
+  context: WrappedRawEvent['context'];
+  timeoutMs: number;
+}): Promise<boolean> {
+  try {
+    await postWithoutReadingBody(
+      `${input.baseUrl}/session/${input.sessionId}/prompt_async`,
+      input.promptBody,
+      input.signal,
+    );
+  } catch (error) {
+    if (isUnsupportedPromptAsyncError(error)) {
+      debug('prompt-async-unsupported', { sessionId: input.sessionId });
+      return false;
     }
+    throw error;
   }
 
-  resumeRun(_input: ResumeRunInput): Promise<AdapterRunHandle> {
-    throw new Error('OpenCodeHostAdapter does not support resume in V1');
-  }
+  debug('prompt-async-started', { sessionId: input.sessionId });
+  await streamAssistantMessage(input);
+  return true;
 }
 
 function emitPromptResponse(
@@ -429,14 +469,25 @@ function emitPromptResponse(
   });
 }
 
-async function pollCompletedAssistantMessage(input: {
+async function streamAssistantMessage(input: {
   baseUrl: string;
   cwd: string;
   sessionId: string;
   signal: AbortSignal;
+  promptBody: Record<string, unknown>;
+  queue: AsyncQueue<WrappedRawEvent>;
+  context: WrappedRawEvent['context'];
   timeoutMs: number;
-}): Promise<OpenCodePromptResponse> {
+}): Promise<void> {
   const deadline = Date.now() + input.timeoutMs;
+  const state: OpenCodeHostStreamState = {
+    usageEmitted: false,
+    emittedToolCalls: new Set<string>(),
+    emittedToolResults: new Set<string>(),
+    emittedTextLength: 0,
+    completed: false,
+  };
+
   while (Date.now() < deadline) {
     if (input.signal.aborted) {
       throw new Error('OpenCode host polling aborted');
@@ -459,17 +510,21 @@ async function pollCompletedAssistantMessage(input: {
       status,
       permissionsReplied: undefined,
     }));
-    const completed = [...messages]
-      .reverse()
-      .find((message) => isCompletedAssistantMessage(message, input.sessionId));
-    if (completed) {
-      return {
-        info: completed.info,
-        parts: completed.parts,
-      };
+    const latest = findLatestAssistantMessage(messages, input.sessionId);
+    if (latest) {
+      emitAssistantMessageProgress({
+        queue: input.queue,
+        context: input.context,
+        message: latest,
+        sessionId: input.sessionId,
+        state,
+      });
+      if (state.completed) {
+        return;
+      }
     }
 
-    await delay(1000);
+    await delay(100);
   }
 
   const messages = await getJson<Array<OpenCodeStoredMessage>>(
@@ -494,6 +549,108 @@ async function pollCompletedAssistantMessage(input: {
       permissionsReplied: permissions.filter((item) => item?.sessionID === input.sessionId).length,
     }))}`,
   );
+}
+
+function emitAssistantMessageProgress(input: {
+  queue: AsyncQueue<WrappedRawEvent>;
+  context: WrappedRawEvent['context'];
+  message: OpenCodeStoredMessage;
+  sessionId: string;
+  state: OpenCodeHostStreamState;
+}): void {
+  const info = isRecord(input.message.info) ? input.message.info : undefined;
+  const usage = info ? readNestedValue(info, 'usage') : undefined;
+  if (!input.state.usageEmitted && isRecord(usage)) {
+    input.queue.push({
+      context: input.context,
+      event: {
+        type: 'run.usage',
+        usage,
+      },
+    });
+    input.state.usageEmitted = true;
+  }
+
+  for (const part of input.message.parts ?? []) {
+    if (!isRecord(part) || readString(part.type) !== 'tool') {
+      continue;
+    }
+
+    const state = isRecord(part.state) ? part.state : {};
+    const callId = readString(part.callID) ?? readString(part.id) ?? 'call_unknown';
+    if (!input.state.emittedToolCalls.has(callId)) {
+      input.queue.push({
+        context: input.context,
+        event: {
+          type: 'tool.call',
+          callID: callId,
+          name: readString(part.tool) ?? 'unknown_tool',
+          input: readNestedValue(state, 'input') ?? {},
+        },
+      });
+      input.state.emittedToolCalls.add(callId);
+    }
+
+    const statusValue = readString(state.status);
+    if (!input.state.emittedToolResults.has(callId) && (statusValue === 'completed' || statusValue === 'error')) {
+      input.queue.push({
+        context: input.context,
+        event: {
+          type: 'tool.result',
+          callID: callId,
+          output: readNestedValue(state, 'output') ?? readNestedValue(state, 'error') ?? null,
+          isError: statusValue === 'error',
+        },
+      });
+      input.state.emittedToolResults.add(callId);
+    }
+  }
+
+  const nextText = flattenAssistantText(input.message);
+  if (nextText.length > input.state.emittedTextLength) {
+    input.queue.push({
+      context: input.context,
+      event: {
+        type: 'text',
+        text: nextText.slice(input.state.emittedTextLength),
+      },
+    });
+    input.state.emittedTextLength = nextText.length;
+  }
+
+  if (!input.state.completed && isCompletedAssistantMessage(input.message, input.sessionId)) {
+    input.queue.push({
+      context: input.context,
+      event: {
+        type: 'run.completed',
+        reason: info ? readString(info.finish) ?? 'stop' : 'stop',
+      },
+    });
+    input.state.completed = true;
+  }
+}
+
+function flattenAssistantText(message: OpenCodeStoredMessage): string {
+  return (message.parts ?? [])
+    .filter((part): part is Record<string, unknown> => isRecord(part) && readString(part.type) === 'text')
+    .map((part) => readString(part.text) ?? '')
+    .join('');
+}
+
+function findLatestAssistantMessage(messages: Array<OpenCodeStoredMessage>, sessionId: string): OpenCodeStoredMessage | undefined {
+  return [...messages]
+    .reverse()
+    .find((message) => {
+      const info = isRecord(message.info) ? message.info : undefined;
+      return readString(info?.role) === 'assistant' && readString(info?.sessionID) === sessionId;
+    });
+}
+
+function isUnsupportedPromptAsyncError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /HTTP (404|405|501)/.test(error.message);
 }
 
 function isCompletedAssistantMessage(message: OpenCodeStoredMessage, sessionId: string): boolean {
@@ -655,6 +812,30 @@ async function postWithoutReadingBody(url: string, body: unknown, signal: AbortS
   }
 }
 
+async function registerMcpServers(input: {
+  baseUrl: string;
+  cwd: string;
+  signal: AbortSignal;
+  mcpServers?: McpServerConfig[];
+}): Promise<void> {
+  const servers = dedupeMcpServersByName(input.mcpServers ?? []);
+  for (const server of servers) {
+    await postJson(
+      `${input.baseUrl}/mcp?directory=${encodeURIComponent(input.cwd)}`,
+      {
+        name: server.name,
+        config: {
+          type: "local",
+          command: [server.command, ...(server.args ?? [])],
+          environment: server.env,
+          enabled: true,
+        },
+      },
+      input.signal,
+    );
+  }
+}
+
 async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, {
     method: 'GET',
@@ -665,6 +846,14 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
     throw new Error(`OpenCode host HTTP ${response.status}: ${await response.text()}`);
   }
   return await response.json() as T;
+}
+
+function dedupeMcpServersByName(servers: McpServerConfig[]): McpServerConfig[] {
+  const deduped = new Map<string, McpServerConfig>();
+  for (const server of servers) {
+    deduped.set(server.name, server);
+  }
+  return [...deduped.values()];
 }
 
 function withDirectoryHeaders(url: string, headers: Record<string, string> = {}): Record<string, string> {

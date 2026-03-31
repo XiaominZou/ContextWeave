@@ -1,19 +1,27 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import http from "node:http";
 import crypto from "node:crypto";
+import { homedir } from "node:os";
 import path from "node:path";
 
+import { normalizeOpenClawAfterTurn, sliceOpenClawTurnMessages, stringifyOpenClawContent } from "../packages/adapter-openclaw/src/index.ts";
 import { createContextPlatform } from "../packages/client/src/platform.ts";
 import { defaultCapabilityPolicy } from "../packages/core/src/policies.ts";
-import { createInMemoryMemorySubsystem } from "../packages/testing/src/in-memory-memory.ts";
-import { InMemoryStore } from "../packages/testing/src/in-memory-store.ts";
+import { createFileBackedMemorySubsystem } from "../packages/testing/src/file-backed-memory.ts";
+import { FileBackedStore } from "../packages/testing/src/file-backed-store.ts";
 
 const HOST = process.env.CTX_OPENCLAW_DAEMON_HOST || "127.0.0.1";
 const PORT = Number(process.env.CTX_OPENCLAW_DAEMON_PORT || "4318");
 const USER_ID = process.env.CTX_OPENCLAW_USER_ID || undefined;
+const STATE_DIR = process.env.CTX_OPENCLAW_DAEMON_STATE_DIR || path.join(homedir(), ".openclaw", "ctx-platform-daemon");
+const STORE_FILE = process.env.CTX_OPENCLAW_DAEMON_STORE_FILE || path.join(STATE_DIR, "platform-store.json");
+const MEMORY_FILE = process.env.CTX_OPENCLAW_DAEMON_MEMORY_FILE || path.join(STATE_DIR, "memory.json");
+const BINDINGS_FILE = process.env.CTX_OPENCLAW_DAEMON_BINDINGS_FILE || path.join(STATE_DIR, "bindings.json");
+const TRANSCRIPTS_FILE = process.env.CTX_OPENCLAW_DAEMON_TRANSCRIPTS_FILE || path.join(STATE_DIR, "transcripts.json");
 
-const store = new InMemoryStore();
-const memorySubsystem = createInMemoryMemorySubsystem();
+const store = new FileBackedStore(STORE_FILE);
+const memorySubsystem = createFileBackedMemorySubsystem(MEMORY_FILE);
 const platform = createContextPlatform({
   store,
   memory: {
@@ -22,10 +30,9 @@ const platform = createContextPlatform({
   },
 });
 const client = platform.client();
-let syntheticOpenClawAdapter;
 
-const bindings = new Map();
-const transcripts = new Map();
+const bindings = loadBindings(BINDINGS_FILE);
+const transcripts = loadTranscripts(TRANSCRIPTS_FILE);
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -72,7 +79,7 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/assemble") {
       const body = await readJson(request);
-      const binding = await ensureBinding(body);
+      let binding = await ensureBinding(body);
 
       if (typeof body.prompt === "string" && body.prompt.trim()) {
         await client.tasks.update(binding.taskId, {
@@ -82,39 +89,25 @@ const server = http.createServer(async (request, response) => {
         });
       }
 
-      const preview = await client.experimental.context.preview({
-        workspaceId: binding.workspaceId,
-        sessionId: binding.sessionId,
-        taskId: binding.taskId,
-        adapter: "openclaw",
-        model: typeof body.model === "string" ? body.model : undefined,
-        metadata: {
-          userId: USER_ID,
-          prompt: typeof body.prompt === "string" ? body.prompt : undefined,
-          workspaceDir: binding.workspaceDir,
-          openclawSessionRef: binding.sessionRef,
-        },
-        policy: {
-          ...defaultCapabilityPolicy,
-          context: "inject",
-          memory: "platform",
-          tasks: "observe-native",
-          artifacts: "observe",
-        },
-      });
+      const prompt = resolvePromptText(body, Array.isArray(body.messages) ? body.messages : []);
+      const preparedResult = await prepareBridgeRun(binding, body, prompt, "superseded_by_new_assemble");
+      binding = preparedResult.binding;
 
-      const systemPromptAddition = renderSnapshot(preview.snapshot, {
-        workspaceDir: binding.workspaceDir,
-        tokenBudget: typeof body.tokenBudget === "number" ? body.tokenBudget : undefined,
+      const assembledMessages = buildAssembledMessages({
+        messages: Array.isArray(body.messages) ? body.messages : [],
+        prompt: typeof body.prompt === "string" ? body.prompt : undefined,
+        systemPromptAddition: preparedResult.prepared.prompt.systemPrompt,
+        contextMode: resolveContextMode(body),
       });
 
       writeJson(response, 200, {
-        messages: Array.isArray(body.messages) ? body.messages : [],
-        estimatedTokens: preview.snapshot.tokenEstimate + estimateMessages(Array.isArray(body.messages) ? body.messages : []),
-        systemPromptAddition,
+        messages: assembledMessages,
+        estimatedTokens: estimateMessages(assembledMessages),
+        systemPromptAddition: undefined,
         binding,
-        snapshotId: preview.snapshot.id,
-        explanation: preview.explanation,
+        runId: preparedResult.prepared.run.id,
+        snapshotId: preparedResult.prepared.snapshot?.id,
+        explanation: preparedResult.prepared.snapshot?.explanation,
       });
       return;
     }
@@ -135,45 +128,61 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/v1/openclaw/context-engine/after-turn") {
       const body = await readJson(request);
-      const binding = await ensureBinding(body);
-      const messages = Array.isArray(body.messages) ? body.messages : [];
-      for (const message of messages) {
+      let binding = await ensureBinding(body);
+      const preparedResult = await ensurePreparedRun(binding, body);
+      binding = preparedResult.binding;
+
+      const normalizedTurn = normalizeOpenClawAfterTurn({
+        run: {
+          workspaceId: binding.workspaceId,
+          sessionId: binding.sessionId,
+          taskId: binding.taskId,
+          runId: preparedResult.run.id,
+        },
+        turn: {
+          sessionId: typeof body.sessionId === "string" ? body.sessionId : binding.sessionRef,
+          sessionKey: typeof body.sessionKey === "string" ? body.sessionKey : binding.sessionRef,
+          messages: Array.isArray(body.messages) ? body.messages : [],
+          prePromptMessageCount: typeof body.prePromptMessageCount === "number" ? body.prePromptMessageCount : 0,
+          autoCompactionSummary: typeof body.autoCompactionSummary === "string" ? body.autoCompactionSummary : undefined,
+          isHeartbeat: Boolean(body.isHeartbeat),
+          model: typeof body.model === "string" ? body.model : undefined,
+          runtimeContext: isRecord(body.runtimeContext) ? body.runtimeContext : undefined,
+          usage: isRecord(body.usage) ? body.usage : undefined,
+          status: typeof body.status === "string" ? body.status : undefined,
+          error: body.error,
+          cancelled: body.cancelled === true,
+        },
+      });
+
+      for (const message of normalizedTurn.newMessages) {
         appendTranscript(binding.sessionId, message);
         await maybeUpdateTaskFromMessage(binding, message);
       }
 
-      const prompt = resolvePromptText(body, messages);
-      syntheticOpenClawAdapter.enqueueTurn({
-        externalRef: binding.sessionRef,
-        rawEvents: buildSyntheticRunEvents(messages, body),
+      for (const event of normalizedTurn.events) {
+        await platform.runtime.bridge.ingestEvent({
+          runId: preparedResult.run.id,
+          rawEvent: event,
+          normalizeEvent: (rawEvent) => rawEvent,
+        });
+      }
+
+      const finalizedRun = await platform.runtime.bridge.finalizeRun({
+        runId: preparedResult.run.id,
+        status: normalizedTurn.finalize.status,
+        reason: normalizedTurn.finalize.reason,
+        error: normalizedTurn.finalize.error,
       });
-      const handle = await client.runs.start({
-        workspaceId: binding.workspaceId,
-        sessionId: binding.sessionId,
-        taskId: binding.taskId,
-        adapter: syntheticOpenClawAdapter.name,
-        model: typeof body.model === "string" ? body.model : undefined,
-        metadata: {
-          userId: USER_ID,
-          prompt,
-          workspaceDir: binding.workspaceDir,
-          openclawSessionRef: binding.sessionRef,
-          openclawAfterTurn: true,
-        },
-        capabilityPolicy: {
-          ...defaultCapabilityPolicy,
-          context: "inject",
-          memory: "platform",
-          tasks: "observe-native",
-          artifacts: "observe",
-        },
-      });
-      const events = await collectEvents(handle);
+      binding = clearPendingRun(binding);
+      const events = store.listEvents(finalizedRun.id);
+
       writeJson(response, 200, {
         ok: true,
         binding,
-        runId: handle.runId,
-        externalRef: handle.externalRef,
+        runId: finalizedRun.id,
+        externalRef: finalizedRun.externalRef,
+        status: finalizedRun.status,
         eventCount: events.length,
         eventTypes: events.map((event) => event.type),
       });
@@ -238,6 +247,41 @@ server.listen(PORT, HOST, () => {
   process.stdout.write(`[ctx-openclaw-daemon] listening on http://${HOST}:${PORT}\n`);
 });
 
+function loadBindings(filePath) {
+  const raw = readJsonFile(filePath, []);
+  return new Map(raw.map((binding) => [`${binding.workspaceDir}::${binding.sessionRef}`, binding]));
+}
+
+function persistBindings(filePath, bindingsMap) {
+  writeJsonFile(filePath, [...bindingsMap.values()]);
+}
+
+function loadTranscripts(filePath) {
+  const raw = readJsonFile(filePath, []);
+  return new Map(raw.map((entry) => [entry.sessionId, Array.isArray(entry.messages) ? entry.messages : []]));
+}
+
+function persistTranscripts(filePath, transcriptMap) {
+  writeJsonFile(filePath, [...transcripts.entries()].map(([sessionId, messages]) => ({ sessionId, messages })));
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "").trim();
+    if (!raw) {
+      return fallback;
+    }
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
 async function ensureBinding(input) {
   const workspaceDir = typeof input.workspaceDir === "string" && input.workspaceDir.trim()
     ? path.resolve(input.workspaceDir)
@@ -289,6 +333,7 @@ async function ensureBinding(input) {
   });
 
   transcripts.set(canonicalSession.id, []);
+  persistTranscripts(TRANSCRIPTS_FILE, transcripts);
 
   const binding = {
     workspaceId,
@@ -297,8 +342,84 @@ async function ensureBinding(input) {
     workspaceDir,
     sessionRef,
   };
-  bindings.set(key, binding);
+  saveBinding(binding);
   return binding;
+}
+
+function saveBinding(binding) {
+  bindings.set(bindingKey(binding), binding);
+  persistBindings(BINDINGS_FILE, bindings);
+  return binding;
+}
+
+function bindingKey(binding) {
+  return `${binding.workspaceDir}::${binding.sessionRef}`;
+}
+
+function clearPendingRun(binding) {
+  if (!binding.pendingRunId && !binding.pendingSnapshotId && !binding.pendingPreparedAt) {
+    return binding;
+  }
+  return saveBinding({
+    ...binding,
+    pendingRunId: undefined,
+    pendingSnapshotId: undefined,
+    pendingPreparedAt: undefined,
+  });
+}
+
+async function cancelPendingRun(binding, reason) {
+  if (typeof binding.pendingRunId !== "string" || !binding.pendingRunId) {
+    return clearPendingRun(binding);
+  }
+  const run = store.getRun(binding.pendingRunId);
+  if (run && !isTerminalRunStatus(run.status)) {
+    await platform.runtime.bridge.finalizeRun({
+      runId: run.id,
+      status: "cancelled",
+      reason,
+    });
+  }
+  return clearPendingRun(binding);
+}
+
+async function prepareBridgeRun(binding, body, prompt, supersededReason) {
+  const clearedBinding = await cancelPendingRun(binding, supersededReason);
+  const prepared = await platform.runtime.bridge.prepareRun({
+    workspaceId: clearedBinding.workspaceId,
+    sessionId: clearedBinding.sessionId,
+    taskId: clearedBinding.taskId,
+    runtime: "openclaw",
+    capabilityPolicy: buildOpenClawCapabilityPolicy(),
+    model: typeof body.model === "string" ? body.model : undefined,
+    metadata: buildBridgeMetadata(clearedBinding, body, prompt),
+  });
+  const nextBinding = saveBinding({
+    ...clearedBinding,
+    pendingRunId: prepared.run.id,
+    pendingSnapshotId: prepared.snapshot?.id,
+    pendingPreparedAt: new Date().toISOString(),
+  });
+  return {
+    binding: nextBinding,
+    prepared,
+  };
+}
+
+async function ensurePreparedRun(binding, body) {
+  if (typeof binding.pendingRunId === "string" && binding.pendingRunId) {
+    const run = store.getRun(binding.pendingRunId);
+    if (run && !isTerminalRunStatus(run.status)) {
+      return { binding, run };
+    }
+  }
+
+  const prompt = resolvePromptText(body, Array.isArray(body.messages) ? body.messages : []);
+  const preparedResult = await prepareBridgeRun(binding, body, prompt, "superseded_by_after_turn_recovery");
+  return {
+    binding: preparedResult.binding,
+    run: preparedResult.prepared.run,
+  };
 }
 
 function appendTranscript(sessionId, message) {
@@ -308,6 +429,7 @@ function appendTranscript(sessionId, message) {
   const list = transcripts.get(sessionId) || [];
   list.push(message);
   transcripts.set(sessionId, list.slice(-200));
+  persistTranscripts(TRANSCRIPTS_FILE, transcripts);
 }
 
 async function maybeUpdateTaskFromMessage(binding, message) {
@@ -318,7 +440,7 @@ async function maybeUpdateTaskFromMessage(binding, message) {
   if (role !== "user") {
     return;
   }
-  const text = stringifyContent(message.content).trim();
+  const text = stringifyOpenClawContent(message.content).trim();
   if (!text) {
     return;
   }
@@ -329,35 +451,55 @@ async function maybeUpdateTaskFromMessage(binding, message) {
   });
 }
 
-function renderSnapshot(snapshot, input) {
-  const sections = [
-    `[CTX_PLATFORM_WORKSPACE] ${input.workspaceDir}`,
-    `[CTX_PLATFORM_SNAPSHOT_ID] ${snapshot.id}`,
-    snapshot.blocks.length
-      ? `[CTX_PLATFORM_CONTEXT]\n${snapshot.blocks.map(renderBlock).join("\n\n")}`
-      : "",
-    typeof input.tokenBudget === "number"
-      ? `[CTX_PLATFORM_BUDGET] ${input.tokenBudget} tokens`
-      : "",
-  ].filter(Boolean);
-  return sections.join("\n\n");
+function buildAssembledMessages(input) {
+  const platformMessage = {
+    role: "system",
+    content: input.systemPromptAddition,
+  };
+
+  if (input.contextMode === "replace") {
+    return [platformMessage, ...selectReplaceMessages(input.messages, input.prompt)];
+  }
+
+  return [platformMessage, ...input.messages];
 }
 
-function renderBlock(block) {
-  const title = block.title ? `${block.kind.toUpperCase()}: ${block.title}` : block.kind.toUpperCase();
-  return `[${title}]\n${block.content}`;
+function selectReplaceMessages(messages, prompt) {
+  const explicitPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  if (explicitPrompt) {
+    return [{ role: "user", content: explicitPrompt }];
+  }
+
+  const filtered = messages.filter((message) => isRecord(message) && typeof message.role === "string" && message.role !== "system");
+  for (let index = filtered.length - 1; index >= 0; index -= 1) {
+    if (filtered[index]?.role === "user") {
+      return filtered.slice(index);
+    }
+  }
+  return filtered;
+}
+
+function resolveContextMode(body) {
+  return body?.contextMode === "replace" ? "replace" : "inject";
 }
 
 function resolvePromptText(body, messages) {
   if (typeof body.prompt === "string" && body.prompt.trim()) {
     return body.prompt.trim();
   }
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
+
+  const turnMessages = sliceOpenClawTurnMessages({
+    messages: Array.isArray(messages) ? messages : [],
+    prePromptMessageCount: typeof body?.prePromptMessageCount === "number" ? body.prePromptMessageCount : 0,
+  });
+  const candidateMessages = turnMessages.length > 0 ? turnMessages : messages;
+
+  for (let index = candidateMessages.length - 1; index >= 0; index -= 1) {
+    const message = candidateMessages[index];
     if (!isRecord(message) || message.role !== "user") {
       continue;
     }
-    const text = stringifyContent(message.content).trim();
+    const text = stringifyOpenClawContent(message.content).trim();
     if (text) {
       return text;
     }
@@ -365,85 +507,32 @@ function resolvePromptText(body, messages) {
   return "OpenClaw turn";
 }
 
-function buildSyntheticRunEvents(messages, body) {
-  const rawEvents = [
-    {
-      type: "run_started",
-      model: typeof body.model === "string" ? body.model : undefined,
-      externalRef: typeof body.sessionKey === "string" ? body.sessionKey : typeof body.sessionId === "string" ? body.sessionId : undefined,
-    },
-  ];
-
-  let messageIndex = 0;
-  let toolIndex = 0;
-  for (const message of messages) {
-    if (!isRecord(message)) {
-      continue;
-    }
-    const role = typeof message.role === "string" ? message.role : "";
-    if (role === "assistant") {
-      const text = stringifyContent(message.content).trim();
-      if (!text) {
-        continue;
-      }
-      rawEvents.push({ type: "text_delta", text });
-      rawEvents.push({ type: "message_completed", messageId: `openclaw_msg_${++messageIndex}` });
-      continue;
-    }
-
-    if (role === "tool") {
-      const toolName = typeof message.name === "string" && message.name ? message.name : `tool_${++toolIndex}`;
-      const callId = typeof message.toolCallId === "string" && message.toolCallId ? message.toolCallId : `tool_call_${toolIndex}`;
-      rawEvents.push({
-        type: "tool_call",
-        callId,
-        name: toolName,
-        input: isRecord(message.input) ? message.input : {},
-      });
-      rawEvents.push({
-        type: "tool_result",
-        callId,
-        output: message.content ?? null,
-        isError: Boolean(message.isError),
-      });
-    }
-  }
-
-  rawEvents.push({ type: "run_completed", reason: typeof body.autoCompactionSummary === "string" ? "turn_complete_with_compaction" : "turn_complete" });
-  return rawEvents;
+function buildOpenClawCapabilityPolicy() {
+  return {
+    ...defaultCapabilityPolicy,
+    context: "inject",
+    memory: "platform",
+    tasks: "observe-native",
+    artifacts: "observe",
+  };
 }
 
-async function collectEvents(handle) {
-  const events = [];
-  for await (const event of handle.streamEvents()) {
-    events.push(event);
-  }
-  return events;
+function buildBridgeMetadata(binding, body, prompt) {
+  return {
+    userId: USER_ID,
+    prompt,
+    workspaceDir: binding.workspaceDir,
+    openclawSessionRef: binding.sessionRef,
+    openclawContextMode: resolveContextMode(body),
+  };
+}
+
+function isTerminalRunStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 function estimateMessages(messages) {
-  return Math.ceil(messages.map((message) => stringifyContent(message?.content)).join("\n").length / 4);
-}
-
-function stringifyContent(content) {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (typeof part === "string") {
-        return part;
-      }
-      if (isRecord(part) && typeof part.text === "string") {
-        return part.text;
-      }
-      return "";
-    }).join("\n");
-  }
-  if (isRecord(content) && typeof content.text === "string") {
-    return content.text;
-  }
-  return "";
+  return Math.ceil(messages.map((message) => stringifyOpenClawContent(message?.content)).join("\n").length / 4);
 }
 
 function isRecord(value) {
@@ -471,149 +560,4 @@ function writeJson(response, status, body) {
   response.statusCode = status;
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.end(JSON.stringify(body));
-}
-
-class SyntheticOpenClawAdapter {
-  name = "openclaw-synthetic";
-  version = "0.1.0";
-  invocationMode = "sdk";
-  capabilities = {
-    invocationMode: "sdk",
-    streaming: true,
-    toolCalls: true,
-    checkpoints: false,
-    resume: false,
-    interrupt: true,
-    nativeMcp: false,
-    capabilitySupport: {
-      context: "intercept",
-      memory: "intercept",
-      tasks: "observe-only",
-      artifacts: "observe-only",
-    },
-  };
-
-  #queue = [];
-  #currentRunContext = null;
-
-  enqueueTurn(turn) {
-    this.#queue.push(turn);
-  }
-
-  async renderContext(input) {
-    return {
-      mode: "sdk",
-      systemPrompt: input.snapshot ? renderSnapshot(input.snapshot, { workspaceDir: String(input.run.metadata?.workspaceDir ?? ""), tokenBudget: undefined }) : "",
-      messages: [],
-      tools: [],
-    };
-  }
-
-  async createRun(input) {
-    const turn = this.#queue.shift();
-    if (!turn) {
-      throw new Error("SyntheticOpenClawAdapter.createRun() called without queued raw events");
-    }
-    this.#currentRunContext = {
-      workspaceId: input.run.workspaceId,
-      sessionId: input.run.sessionId,
-      taskId: input.run.taskId,
-      runId: input.run.id,
-    };
-    let cancelled = false;
-    return {
-      externalRef: turn.externalRef,
-      streamEvents: async function* () {
-        for (const rawEvent of turn.rawEvents) {
-          if (cancelled) {
-            break;
-          }
-          yield rawEvent;
-        }
-      },
-      cancel: async () => {
-        cancelled = true;
-      },
-    };
-  }
-
-  normalizeEvent(rawEvent) {
-    if (!isRecord(rawEvent) || typeof rawEvent.type !== "string") {
-      return null;
-    }
-    const context = this.#currentRunContext ?? {
-      workspaceId: "ws_contract",
-      sessionId: "sess_contract",
-      taskId: "task_contract",
-      runId: "run_contract",
-    };
-    return {
-      id: `evt_${Math.random().toString(36).slice(2, 10)}`,
-      workspaceId: context.workspaceId,
-      sessionId: context.sessionId,
-      taskId: context.taskId,
-      runId: context.runId,
-      adapter: this.name,
-      timestamp: new Date().toISOString(),
-      type: normalizeSyntheticType(rawEvent.type),
-      payload: normalizeSyntheticPayload(rawEvent),
-    };
-  }
-}
-
-syntheticOpenClawAdapter = new SyntheticOpenClawAdapter();
-platform.runtime.adapters.register(syntheticOpenClawAdapter);
-
-function normalizeSyntheticType(type) {
-  switch (type) {
-    case "run_started":
-      return "run.started";
-    case "text_delta":
-      return "message.delta";
-    case "message_completed":
-      return "message.completed";
-    case "tool_call":
-      return "tool.call";
-    case "tool_result":
-      return "tool.result";
-    case "run_completed":
-      return "run.completed";
-    case "run_failed":
-      return "run.failed";
-    case "run_cancelled":
-      return "run.cancelled";
-    default:
-      return type;
-  }
-}
-
-function normalizeSyntheticPayload(rawEvent) {
-  switch (rawEvent.type) {
-    case "run_started":
-      return { model: rawEvent.model, externalRef: rawEvent.externalRef };
-    case "text_delta":
-      return { role: "assistant", text: typeof rawEvent.text === "string" ? rawEvent.text : "" };
-    case "message_completed":
-      return { messageId: typeof rawEvent.messageId === "string" ? rawEvent.messageId : "msg_unknown" };
-    case "tool_call":
-      return {
-        callId: typeof rawEvent.callId === "string" ? rawEvent.callId : "call_unknown",
-        name: typeof rawEvent.name === "string" ? rawEvent.name : "unknown_tool",
-        input: rawEvent.input ?? {},
-      };
-    case "tool_result":
-      return {
-        callId: typeof rawEvent.callId === "string" ? rawEvent.callId : "call_unknown",
-        output: rawEvent.output ?? null,
-        isError: Boolean(rawEvent.isError),
-      };
-    case "run_completed":
-      return { reason: typeof rawEvent.reason === "string" ? rawEvent.reason : undefined };
-    case "run_failed":
-      return { error: rawEvent.error ?? { code: "OPENCLAW_SYNTHETIC_ERROR", message: "synthetic run failed" } };
-    case "run_cancelled":
-      return { reason: typeof rawEvent.reason === "string" ? rawEvent.reason : undefined };
-    default:
-      return {};
-  }
 }

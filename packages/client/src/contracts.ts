@@ -21,7 +21,7 @@ import type {
   WriteConfirmedInput,
   WriteExperienceInput,
 } from "@ctx/core";
-import type { AdapterCapabilities, AgentAdapter } from "@ctx/adapter-kit";
+import type { AdapterCapabilities, AgentAdapter, ToolBridgeRenderContext } from "@ctx/adapter-kit";
 
 export interface CreateSessionInput {
   workspaceId: string;
@@ -129,6 +129,81 @@ export interface RunAPI {
   interrupt(runId: string): Promise<void>;
 }
 
+export interface PrepareTransparentRunInput {
+  workspaceId: string;
+  sessionId: string;
+  taskId: string;
+  runtime: string;
+  capabilityPolicy?: Partial<CapabilityPolicy>;
+  model?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TransparentRuntimePrompt {
+  systemPrompt: string;
+}
+
+export interface PreparedTransparentRun {
+  run: Run;
+  policy: CapabilityPolicy;
+  snapshot: ContextSnapshot | null;
+  prompt: TransparentRuntimePrompt;
+  toolBridge?: ToolBridgeRenderContext;
+}
+
+export interface ResumeTransparentRunInput {
+  checkpointId: string;
+  runtime?: string;
+  capabilityPolicy?: Partial<CapabilityPolicy>;
+  model?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface IngestTransparentRuntimeEventInput {
+  runId: string;
+  rawEvent: unknown;
+  normalizeEvent(rawEvent: unknown): AgentEventEnvelope | null;
+}
+
+export interface IngestTransparentRuntimeEventResult {
+  run: Run;
+  events: AgentEventEnvelope[];
+  terminal: boolean;
+}
+
+export interface FinalizeTransparentRunInput {
+  runId: string;
+  status: "completed" | "failed" | "cancelled";
+  adapter?: string;
+  reason?: string;
+  error?: Run["error"];
+}
+
+export interface CreateTransparentCheckpointInput {
+  runId: string;
+  payload?: unknown;
+  adapterVersion?: string;
+}
+
+export interface CreateTransparentCheckpointResult {
+  checkpoint: Checkpoint;
+  event: AgentEventEnvelope<{ checkpointId: string }>;
+}
+
+export interface SyncTransparentRuntimeTaskInput {
+  taskId: string;
+  patch: UpdateTaskInput;
+}
+
+export interface TransparentRuntimeBridgeAPI {
+  prepareRun(input: PrepareTransparentRunInput): Promise<PreparedTransparentRun>;
+  prepareResumeRun(input: ResumeTransparentRunInput): Promise<PreparedTransparentRun>;
+  ingestEvent(input: IngestTransparentRuntimeEventInput): Promise<IngestTransparentRuntimeEventResult>;
+  finalizeRun(input: FinalizeTransparentRunInput): Promise<Run>;
+  createCheckpoint(input: CreateTransparentCheckpointInput): Promise<CreateTransparentCheckpointResult>;
+  syncTask(input: SyncTransparentRuntimeTaskInput): Promise<Task>;
+}
+
 export interface EventAPI {
   list(input: ListEventsInput): Promise<Paginated<AgentEventEnvelope>>;
 }
@@ -211,6 +286,7 @@ export interface ContextPlatform {
 
 export interface PlatformRuntime {
   adapters: AdapterRegistryAPI;
+  bridge: TransparentRuntimeBridgeAPI;
   memory?: MemoryBindings;
 }
 

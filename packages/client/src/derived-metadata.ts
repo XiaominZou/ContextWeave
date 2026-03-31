@@ -22,3 +22,8 @@ export {
   type NativeTaskMirrorV1,
   type MirroredNativeTaskItemV1,
 } from "./internal/task-native-mirror";
+export {
+  RUN_NATIVE_MIRROR_METADATA_KEY,
+  readNativeRunMirror,
+  type NativeRunMirrorV1,
+} from "./internal/run-native-mirror";
