@@ -443,6 +443,93 @@ describe("context snapshot builder", () => {
     expect(snapshot.blocks.some((block) => block.metadata?.["sourceType"] === "run-summary")).toBe(false);
   });
 
+  test("replace mode keeps task state but drops volatile progress summaries", async () => {
+    const memoryApi = makeMemoryApi();
+    const task: Task = makeTask({
+      metadata: {
+        [TASK_SUMMARY_METADATA_KEY]: {
+          version: "1",
+          generatedAt: new Date().toISOString(),
+          taskStatus: "ready",
+          runCount: 2,
+          completedRunCount: 1,
+          failedRunCount: 1,
+          cancelledRunCount: 0,
+          indexedToolCallCount: 1,
+          latestRunIds: ["run_prev"],
+          recentReadFilePaths: ["/README.md"],
+          recentEditedFilePaths: ["/app/store.py"],
+          recentCommandPreviews: ["npm test"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+            lastTestCommand: "python -m pytest tests/ -q",
+            unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+          },
+          recentFailureHints: ["write_file: permission denied"],
+          latestAssistantOutputPreview: "Focus on validation gap in tasks route.",
+          summaryText: "Task summary says auth work already has one failed and one successful attempt.",
+        },
+      },
+    });
+    const priorRun: Run = {
+      id: "run_prev",
+      workspaceId: "ws_1",
+      sessionId: "sess_1",
+      taskId: "task_1",
+      adapter: "mock",
+      status: "completed",
+      attempt: 1,
+      endedAt: new Date().toISOString(),
+      metadata: {
+        [RUN_SUMMARY_METADATA_KEY]: {
+          version: "1",
+          generatedAt: new Date().toISOString(),
+          status: "completed",
+          messageCount: 1,
+          toolCallCount: 1,
+          indexedToolCallCount: 1,
+          readFilePaths: ["/README.md"],
+          editedFilePaths: ["/app/store.py"],
+          commandPreviews: ["python -m pytest tests/ -q"],
+          repairState: {
+            version: "1",
+            failingTests: ["tests/test_tasks.py::test_duplicate_tags_returns_422"],
+            lastTestCommand: "python -m pytest tests/ -q",
+            unresolvedConstraints: ["AssertionError: duplicate tags should return 422"],
+          },
+          failureHints: ["write_file: permission denied"],
+          assistantOutputPreview: "Focus on validation gap in tasks route.",
+          summaryText: "Prior run fixed the middleware shape but left one validation gap.",
+        },
+      },
+    };
+
+    const snapshot = await buildContextSnapshot({
+      run: makeRun(),
+      task,
+      policy: {
+        context: "replace",
+        memory: "off",
+        tasks: "observe-native",
+        artifacts: "observe",
+        contextHints: {
+          suppressRunSummaries: true,
+        },
+      },
+      memoryApi,
+      store: makeStore({ tasks: [task], runs: [priorRun] }),
+    });
+
+    const taskBlock = snapshot.blocks.find((block) => block.metadata?.["sourceType"] === "task");
+    expect(taskBlock?.content).toContain("Likely target files: /app/store.py");
+    expect(taskBlock?.content).toContain("Recent working set: /README.md");
+    expect(taskBlock?.content).toContain("Failing tests: tests/test_tasks.py::test_duplicate_tags_returns_422");
+    expect(taskBlock?.content).not.toContain("Latest progress:");
+    expect(taskBlock?.content).not.toContain("Native mirror:");
+    expect(snapshot.blocks.some((block) => block.metadata?.["sourceType"] === "run-summary")).toBe(false);
+  });
+
   test("prefers session preload memory blocks and deduplicates matching task search hits", async () => {
     const memoryApi = makeMemoryApi();
     const preloadHit: MemorySearchHit = {

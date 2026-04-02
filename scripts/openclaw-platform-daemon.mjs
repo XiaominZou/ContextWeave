@@ -90,14 +90,15 @@ const server = http.createServer(async (request, response) => {
       }
 
       const prompt = resolvePromptText(body, Array.isArray(body.messages) ? body.messages : []);
-      const preparedResult = await prepareBridgeRun(binding, body, prompt, "superseded_by_new_assemble");
+      const contextMode = resolveContextMode(body);
+      const preparedResult = await prepareBridgeRun(binding, body, prompt, contextMode, "superseded_by_new_assemble");
       binding = preparedResult.binding;
 
       const assembledMessages = buildAssembledMessages({
         messages: Array.isArray(body.messages) ? body.messages : [],
         prompt: typeof body.prompt === "string" ? body.prompt : undefined,
         systemPromptAddition: preparedResult.prepared.prompt.systemPrompt,
-        contextMode: resolveContextMode(body),
+        contextMode,
       });
 
       writeJson(response, 200, {
@@ -383,14 +384,14 @@ async function cancelPendingRun(binding, reason) {
   return clearPendingRun(binding);
 }
 
-async function prepareBridgeRun(binding, body, prompt, supersededReason) {
+async function prepareBridgeRun(binding, body, prompt, contextMode, supersededReason) {
   const clearedBinding = await cancelPendingRun(binding, supersededReason);
   const prepared = await platform.runtime.bridge.prepareRun({
     workspaceId: clearedBinding.workspaceId,
     sessionId: clearedBinding.sessionId,
     taskId: clearedBinding.taskId,
     runtime: "openclaw",
-    capabilityPolicy: buildOpenClawCapabilityPolicy(),
+    capabilityPolicy: buildOpenClawCapabilityPolicy(contextMode),
     model: typeof body.model === "string" ? body.model : undefined,
     metadata: buildBridgeMetadata(clearedBinding, body, prompt),
   });
@@ -415,7 +416,7 @@ async function ensurePreparedRun(binding, body) {
   }
 
   const prompt = resolvePromptText(body, Array.isArray(body.messages) ? body.messages : []);
-  const preparedResult = await prepareBridgeRun(binding, body, prompt, "superseded_by_after_turn_recovery");
+  const preparedResult = await prepareBridgeRun(binding, body, prompt, resolveContextMode(body), "superseded_by_after_turn_recovery");
   return {
     binding: preparedResult.binding,
     run: preparedResult.prepared.run,
@@ -465,18 +466,36 @@ function buildAssembledMessages(input) {
 }
 
 function selectReplaceMessages(messages, prompt) {
-  const explicitPrompt = typeof prompt === "string" ? prompt.trim() : "";
-  if (explicitPrompt) {
-    return [{ role: "user", content: explicitPrompt }];
+  const filtered = messages.filter((message) => isRecord(message) && typeof message.role === "string" && message.role !== "system");
+  const tail = selectReplaceMessageTail(filtered);
+  if (tail.length > 0) {
+    return tail;
   }
 
-  const filtered = messages.filter((message) => isRecord(message) && typeof message.role === "string" && message.role !== "system");
-  for (let index = filtered.length - 1; index >= 0; index -= 1) {
-    if (filtered[index]?.role === "user") {
-      return filtered.slice(index);
-    }
+  const explicitPrompt = typeof prompt === "string" && prompt.trim() ? prompt.trim() : "";
+  return explicitPrompt ? [{ role: "user", content: explicitPrompt }] : filtered;
+}
+
+function selectReplaceMessageTail(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
   }
-  return filtered;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role !== "user") {
+      continue;
+    }
+
+    const tail = messages.slice(index);
+    if (tail.length <= 8) {
+      return tail;
+    }
+
+    // Preserve the current user instruction plus the most recent tool/assistant state.
+    return [tail[0], ...tail.slice(-7)];
+  }
+
+  return messages.slice(-8);
 }
 
 function resolveContextMode(body) {
@@ -507,13 +526,18 @@ function resolvePromptText(body, messages) {
   return "OpenClaw turn";
 }
 
-function buildOpenClawCapabilityPolicy() {
+function buildOpenClawCapabilityPolicy(contextMode = "inject") {
   return {
     ...defaultCapabilityPolicy,
-    context: "inject",
+    context: contextMode,
     memory: "platform",
     tasks: "observe-native",
     artifacts: "observe",
+    contextHints: contextMode === "replace"
+      ? {
+          suppressRunSummaries: true,
+        }
+      : undefined,
   };
 }
 

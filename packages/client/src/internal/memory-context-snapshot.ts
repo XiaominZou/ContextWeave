@@ -95,7 +95,7 @@ async function collectPreloadedMemoryBlocks(input: ContextCollectorInput): Promi
 }
 
 async function collectTaskBlocks(input: ContextCollectorInput): Promise<ContextBlock[]> {
-  return [buildTaskContextBlock(input.task)];
+  return [buildTaskContextBlock(input)];
 }
 
 async function collectTaskSummaryBlocks(input: ContextCollectorInput): Promise<ContextBlock[]> {
@@ -291,11 +291,13 @@ async function collectMemoryBlocks(input: ContextCollectorInput): Promise<Contex
     .map((hit) => buildMemoryContextBlock(hit, "pre-run"));
 }
 
-function buildTaskContextBlock(task: Task): ContextBlock {
+function buildTaskContextBlock(input: ContextCollectorInput): ContextBlock {
+  const task = input.task;
   const nativeMirror = readNativeTaskMirror(task);
   const taskSummary = readTaskSummary(task);
   const repairState = taskSummary?.repairState;
   const fallbackFailureHints = filterFallbackFailureHints(taskSummary?.recentFailureHints ?? [], repairState);
+  const includeVolatileProgress = input.policy.context !== "replace";
   const lines = [
     `[TASK] ${task.title}`,
     task.objective ? `Objective: ${task.objective}` : undefined,
@@ -310,9 +312,11 @@ function buildTaskContextBlock(task: Task): ContextBlock {
       ? `Unresolved constraints: ${repairState.unresolvedConstraints.join("; ")}`
       : undefined,
     fallbackFailureHints.length ? `Known failures: ${fallbackFailureHints.join(" | ")}` : undefined,
-    taskSummary?.latestAssistantOutputPreview ? `Latest progress: ${taskSummary.latestAssistantOutputPreview}` : undefined,
-    nativeMirror ? `Native mirror: ${nativeMirror.summaryText}` : undefined,
-    nativeMirror?.currentFocus ? `Current focus: ${nativeMirror.currentFocus}` : undefined,
+    includeVolatileProgress && taskSummary?.latestAssistantOutputPreview
+      ? `Latest progress: ${taskSummary.latestAssistantOutputPreview}`
+      : undefined,
+    includeVolatileProgress && nativeMirror ? `Native mirror: ${nativeMirror.summaryText}` : undefined,
+    includeVolatileProgress && nativeMirror?.currentFocus ? `Current focus: ${nativeMirror.currentFocus}` : undefined,
   ].filter((value): value is string => Boolean(value));
 
   const content = lines.join("\n");
